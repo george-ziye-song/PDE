@@ -164,6 +164,18 @@ def convert_ns_incom(input_dir: str, output_dir: str = None):
         # Store scalar indices
         f_out.create_dataset('scalar_indices', data=scalar_indices)
 
+        # Store per-sample nu (fixed at 0.01 for all samples)
+        nu = 0.01  # PDEBench ns_incom_inhom
+        f_out.create_dataset('nu', data=np.full(total_samples, nu, dtype=np.float32))
+
+        # Store physics attributes
+        dt_raw = None  # will be read from first file
+        f_out.attrs['nu'] = nu
+        f_out.attrs['Lx'] = 1.0
+        f_out.attrs['Ly'] = 1.0
+        f_out.attrs['boundary'] = 'noslip'
+        f_out.attrs['source'] = 'PDEBench ns_incom_inhom_2d'
+
         # Convert each file
         sample_offset = 0
         for h5_file in h5_files:
@@ -171,6 +183,15 @@ def convert_ns_incom(input_dir: str, output_dir: str = None):
 
             with h5py.File(h5_file, 'r') as f_in:
                 n_samples = f_in['velocity'].shape[0]
+
+                # Read dt from first file
+                if dt_raw is None and 't' in f_in:
+                    t_arr = f_in['t'][0]  # [T]
+                    dt_raw = float(t_arr[1] - t_arr[0])
+                    f_out.attrs['dt'] = dt_raw
+                    f_out.attrs['nx'] = H
+                    f_out.attrs['ny'] = W
+                    print(f"  dt = {dt_raw}")
 
                 # Process each sample in the file
                 for i in tqdm(range(n_samples), desc=f"  {h5_file.name}"):
@@ -221,13 +242,6 @@ def convert_ns_incom(input_dir: str, output_dir: str = None):
         print(f"  scalar[..., 0] (particles): min={scalar[..., 0].min():.4f}, max={scalar[..., 0].max():.4f}")
         print(f"  force: min={force.min():.4f}, max={force.max():.4f}")
         print(f"  scalar_indices: {indices.tolist()}")
-
-    # Delete original files after successful conversion
-    print(f"\nDeleting original files...")
-    for h5_file in h5_files:
-        print(f"  Deleting {h5_file.name}")
-        os.remove(h5_file)
-    print("Original files deleted.")
 
     print(f"\n{'='*60}")
     print(f"Done! Output: {output_path}")

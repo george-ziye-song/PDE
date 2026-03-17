@@ -1,0 +1,133 @@
+# NS Incompressible Inhomogeneous LoRA Finetuning Configuration (V3 Model)
+# Incompressible NS + Tracer + Inhomogeneous Forcing, no-slip walls
+# Loss: BC (supervised anchor) + Noslip (u=v=0 at walls) + PDE (cont + momentum + tracer)
+# Channels: Vx(0), Vy(1), tracer(14), pressure(15)
+# Force: time-invariant per-sample field from HDF5
+
+model_name: ns_incom_lora_v3
+
+model:
+  # Must match pretrained V3s model architecture
+  in_channels: 18
+  hidden_dim: 768
+  patch_size: 16
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+  encoder:
+    stem_hidden: 128
+    stem_out: 256
+    use_cnn_pool: false
+
+  intra_patch:
+    num_layers: 2
+    temporal_window: 3
+    num_heads: 8
+
+  na:
+    base_kernel: 5
+
+  decoder:
+    stem_channels: 256
+    hidden_channels: 128
+
+  vector_channels: 3
+  scalar_channels: 15
+
+  enable_1d: false
+  enable_3d: false
+
+  pretrained_path: ./checkpoints_v4_2donly/best_tf.pt
+  gradient_checkpointing: true
+
+  freeze_encoder: false
+  freeze_decoder: false
+
+  patch_smoother:
+    enabled: true
+    hidden_dim: 32
+
+  # LoRA configuration
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - qkv
+      - proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+training:
+  max_epochs: 30
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  warmup_steps: 50
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+  # Loss weights
+  lambda_bc: 10000.0     # Boundary RMSE (supervised anchor)
+  lambda_noslip: 1000.0  # No-slip wall loss (u=v=0 at boundaries)
+  lambda_pde: 1          # PDE residual loss
+
+  # Save criterion: save_vrmse_weight * val_vrmse + save_pde_weight * val_pde
+  save_vrmse_weight: 100
+  save_pde_weight: 1
+
+  eval_interval: 100
+  early_stopping_patience: 30
+
+  mixed_precision: "no"
+  gradient_accumulation_steps: 4
+
+dataloader:
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: /scratch-share/SONG0304/finetune/ns_incom_inhom_2d_512.hdf5
+  seed: 42
+  t_input: 8
+  train_ratio: 0.75       # Only 4 samples → 3 train, 1 val
+  clips_per_sample: 200
+  val_time_interval: 8
+  vector_dim: 2
+
+logging:
+  project: pde-ns-incom-lora
+  entity: null
+  save_dir: ./checkpoints_ns_incom_lora_v3
+  log_interval: 10
+
+checkpoint:
+  resume_from: null
+
+physics:
+  nx: 512
+  ny: 512
+  Lx: 1.0
+  Ly: 1.0
+  dt: 0.005
+  nu: 0.01       # PDEBench ns_incom: ν = 0.01
+  skip_bl: 2     # Skip boundary cells for PDE loss
+
+  # Per-equation normalization scales (GT RMS, from test_gt_pde_ns_incom.py)
+  # Default hardcoded in NSIncomPDELoss: cont=7e-4, mom_u=1.34, mom_v=1.31, tracer=0.24
+  # Uncomment to override:
+  # eq_scales:
+  #   continuity: 7.0e-4
+  #   u_momentum: 1.34
+  #   v_momentum: 1.31
+  #   tracer: 0.24
+
+  # Per-equation weights (default 1.0 for all)
+  # eq_weights:
+  #   continuity: 1.0
+  #   u_momentum: 1.0
+  #   v_momentum: 1.0
+  #   tracer: 1.0

@@ -49,6 +49,7 @@ class DatasetConfig:
     val_clips: Optional[int] = None  # Per-sample val clip count (None = use all available)
     vector_dim: int = 0  # Actual vector dimensions (0=no vector, 2=2D, 3=3D)
     clips_per_epoch: Optional[int] = None  # If set, override clips_ratio with fixed number per epoch
+    val_samples: Optional[int] = None  # Force exact number of val samples (overrides train_ratio)
 
 
 # Scalar channel indices (from scalar_channel.csv)
@@ -131,7 +132,13 @@ class SingleDataset:
         """Split samples into train/val sets."""
         rng = np.random.RandomState(self.seed)
         indices = rng.permutation(self.n_samples)
-        split_idx = int(self.n_samples * self.train_ratio)
+
+        # val_samples override takes priority over train_ratio
+        if self.config.val_samples is not None:
+            n_val = min(self.config.val_samples, self.n_samples)
+            split_idx = self.n_samples - n_val
+        else:
+            split_idx = int(self.n_samples * self.train_ratio)
 
         if self.split == 'train':
             self.sample_indices = indices[:split_idx].tolist()
@@ -499,13 +506,13 @@ def create_pretrain_dataloaders(
         ),
         DatasetConfig(
             name='diffusion_reaction',
-            path=str(data_dir / 'pretrained' / '2D_diff-react_NA_NA.hdf5'),
+            path=str('/home/msai/song0304/code/PDE/data/pretrained/2D_diff-react_NA_NA.hdf5'),
             val_clips=47,
             vector_dim=0,  # No vector, only scalar (concentration_u, concentration_v)
         ),
         DatasetConfig(
             name='2d_cfd',
-            path=str(data_dir / 'pretrained' / '2D_CFD_128_merged.hdf5'),
+            path=str('/home/msai/song0304/code/PDE/data/pretrained/2D_CFD_128_merged.hdf5'),
             vector_dim=2,  # 2D velocity (Vx, Vy); T≤30, val uses all clips
         ),
         DatasetConfig(

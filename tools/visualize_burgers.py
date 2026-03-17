@@ -25,6 +25,20 @@ from dataset_burgers import BurgersDataset, burgers_collate_fn
 from finetune.pde_loss import burgers_pde_loss
 
 
+def _vrmse_np(gt: np.ndarray, pred: np.ndarray, eps: float = 1e-8) -> float:
+    """Variance-normalized RMSE."""
+    mse = np.mean((pred - gt) ** 2)
+    var = np.mean((gt - gt.mean()) ** 2)
+    return float(np.sqrt(mse / (var + eps)))
+
+
+def _vrmse_torch(gt: torch.Tensor, pred: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Variance-normalized RMSE (torch)."""
+    mse = torch.mean((pred - gt) ** 2)
+    var = torch.mean((gt - gt.mean()) ** 2)
+    return torch.sqrt(mse / (var + eps))
+
+
 def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
@@ -152,7 +166,8 @@ def plot_burgers_results(
         # Pred u
         im1 = axes[row, 1].imshow(pred_u, origin='lower', extent=extent, cmap='jet', vmin=vmin_u, vmax=vmax_u)
         rmse_u = np.sqrt(np.mean((pred_u - gt_u)**2))
-        axes[row, 1].set_title(f'Pred u (RMSE={rmse_u:.4f})', fontsize=11)
+        vrmse_u = _vrmse_np(gt_u, pred_u)
+        axes[row, 1].set_title(f'Pred u (RMSE={rmse_u:.4f} VRMSE={vrmse_u:.4f})', fontsize=11)
         plt.colorbar(im1, ax=axes[row, 1], fraction=0.046, pad=0.04)
 
         # Residual u
@@ -175,7 +190,8 @@ def plot_burgers_results(
         # Pred v
         im4 = axes[row, 4].imshow(pred_v, origin='lower', extent=extent, cmap='jet', vmin=vmin_v, vmax=vmax_v)
         rmse_v = np.sqrt(np.mean((pred_v - gt_v)**2))
-        axes[row, 4].set_title(f'Pred v (RMSE={rmse_v:.4f})', fontsize=11)
+        vrmse_v = _vrmse_np(gt_v, pred_v)
+        axes[row, 4].set_title(f'Pred v (RMSE={rmse_v:.4f} VRMSE={vrmse_v:.4f})', fontsize=11)
         plt.colorbar(im4, ax=axes[row, 4], fraction=0.046, pad=0.04)
 
         # Residual v
@@ -291,6 +307,8 @@ def main():
     results = []
     all_rmse_u = []
     all_rmse_v = []
+    all_vrmse_u = []
+    all_vrmse_v = []
     all_pde_loss = []
 
     for i, sample_idx in enumerate(sample_indices):
@@ -338,11 +356,16 @@ def main():
 
         rmse_u = np.sqrt(np.mean((pred_u - gt_u)**2))
         rmse_v = np.sqrt(np.mean((pred_v - gt_v)**2))
+        vrmse_u = _vrmse_np(gt_u, pred_u)
+        vrmse_v = _vrmse_np(gt_v, pred_v)
         all_rmse_u.append(rmse_u)
         all_rmse_v.append(rmse_v)
+        all_vrmse_u.append(vrmse_u)
+        all_vrmse_v.append(vrmse_v)
         all_pde_loss.append(pde_loss)
 
-        print(f"  Sample {sample_idx}: ν={nu:.3f}, RMSE_u={rmse_u:.4f}, RMSE_v={rmse_v:.4f}, PDE={pde_loss:.2f}")
+        print(f"  Sample {sample_idx}: ν={nu:.3f}, RMSE_u={rmse_u:.4f}, VRMSE_u={vrmse_u:.4f}, "
+              f"RMSE_v={rmse_v:.4f}, VRMSE_v={vrmse_v:.4f}, PDE={pde_loss:.2f}")
 
     # Plot all samples
     output_filename = f"visualization_burgers_{model_suffix}.png"
@@ -358,9 +381,11 @@ def main():
     print("=" * 60)
     print(f"Output: {output_dir / output_filename}")
     print(f"\nAverage Metrics ({len(results)} samples):")
-    print(f"  - RMSE (u): {np.mean(all_rmse_u):.6f}")
-    print(f"  - RMSE (v): {np.mean(all_rmse_v):.6f}")
-    print(f"  - PDE Loss: {np.mean(all_pde_loss):.2f}")
+    print(f"  - RMSE  (u): {np.mean(all_rmse_u):.6f}")
+    print(f"  - VRMSE (u): {np.mean(all_vrmse_u):.6f}")
+    print(f"  - RMSE  (v): {np.mean(all_rmse_v):.6f}")
+    print(f"  - VRMSE (v): {np.mean(all_vrmse_v):.6f}")
+    print(f"  - PDE Loss:  {np.mean(all_pde_loss):.2f}")
     print("=" * 60)
 
 

@@ -33,6 +33,27 @@ from finetune.model_lora_v2 import PDELoRAModelV2, load_lora_checkpoint
 from finetune.pde_loss import burgers_pde_loss
 
 
+def _vrmse_np(gt: np.ndarray, pred: np.ndarray, eps: float = 1e-8) -> float:
+    """Variance-normalized RMSE."""
+    mse = np.mean((pred - gt) ** 2)
+    var = np.mean((gt - gt.mean()) ** 2)
+    return float(np.sqrt(mse / (var + eps)))
+
+
+def _vrmse_torch(gt: torch.Tensor, pred: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Variance-normalized RMSE (torch)."""
+    mse = torch.mean((pred - gt) ** 2)
+    var = torch.mean((gt - gt.mean()) ** 2)
+    return torch.sqrt(mse / (var + eps))
+
+
+def _nrmse_torch(gt: torch.Tensor, pred: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """nRMSE: sqrt(MSE(pred, gt) / MSE(0, gt))."""
+    mse_pred = torch.mean((pred - gt) ** 2)
+    mse_zero = torch.mean(gt ** 2)
+    return torch.sqrt(mse_pred / (mse_zero + eps))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="LoRA V2 Visualization for Burgers")
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint')
@@ -149,7 +170,11 @@ def scan_all_distributed(accelerator, model, val_loader, config, t_input):
     total_pde = torch.zeros(1, device=accelerator.device)
     total_rmse_u = torch.zeros(1, device=accelerator.device)
     total_rmse_v = torch.zeros(1, device=accelerator.device)
+    total_vrmse_u = torch.zeros(1, device=accelerator.device)
+    total_vrmse_v = torch.zeros(1, device=accelerator.device)
     total_rmse = torch.zeros(1, device=accelerator.device)
+    total_vrmse_all = torch.zeros(1, device=accelerator.device)
+    total_nrmse_all = torch.zeros(1, device=accelerator.device)
     num_batches = torch.zeros(1, device=accelerator.device)
 
     for batch in val_loader:
@@ -178,6 +203,8 @@ def scan_all_distributed(accelerator, model, val_loader, config, t_input):
 
         rmse_u = torch.sqrt(torch.mean((out_u - tgt_u) ** 2) + 1e-8)
         rmse_v = torch.sqrt(torch.mean((out_v - tgt_v) ** 2) + 1e-8)
+        vrmse_u = _vrmse_torch(tgt_u, out_u)
+        vrmse_v = _vrmse_torch(tgt_v, out_v)
 
         # Overall RMSE (valid channels)
         valid_ch = (
@@ -188,10 +215,23 @@ def scan_all_distributed(accelerator, model, val_loader, config, t_input):
         mse = torch.mean((output[..., valid_ch] - target_data[..., valid_ch]) ** 2)
         rmse = torch.sqrt(mse + 1e-8)
 
+        # Combined vrmse/nrmse across all valid channels
+        output_valid = output[..., valid_ch]
+        target_valid = target_data[..., valid_ch]
+        mse_all = torch.mean((output_valid - target_valid) ** 2)
+        var_all = torch.mean((target_valid - target_valid.mean()) ** 2)
+        vrmse_all = torch.sqrt(mse_all / (var_all + 1e-8))
+        mse_zero_all = torch.mean(target_valid ** 2)
+        nrmse_all = torch.sqrt(mse_all / (mse_zero_all + 1e-8))
+
         total_pde += pde_loss.detach()
         total_rmse_u += rmse_u.detach()
         total_rmse_v += rmse_v.detach()
+        total_vrmse_u += vrmse_u.detach()
+        total_vrmse_v += vrmse_v.detach()
         total_rmse += rmse.detach()
+        total_vrmse_all += vrmse_all.detach()
+        total_nrmse_all += nrmse_all.detach()
         num_batches += 1
 
     # Reduce across all ranks
@@ -199,7 +239,11 @@ def scan_all_distributed(accelerator, model, val_loader, config, t_input):
     total_pde = accelerator.reduce(total_pde, reduction='sum')
     total_rmse_u = accelerator.reduce(total_rmse_u, reduction='sum')
     total_rmse_v = accelerator.reduce(total_rmse_v, reduction='sum')
+    total_vrmse_u = accelerator.reduce(total_vrmse_u, reduction='sum')
+    total_vrmse_v = accelerator.reduce(total_vrmse_v, reduction='sum')
     total_rmse = accelerator.reduce(total_rmse, reduction='sum')
+    total_vrmse_all = accelerator.reduce(total_vrmse_all, reduction='sum')
+    total_nrmse_all = accelerator.reduce(total_nrmse_all, reduction='sum')
     num_batches = accelerator.reduce(num_batches, reduction='sum')
     accelerator.wait_for_everyone()
 
@@ -208,15 +252,24 @@ def scan_all_distributed(accelerator, model, val_loader, config, t_input):
         avg_pde = (total_pde / n).item()
         avg_rmse_u = (total_rmse_u / n).item()
         avg_rmse_v = (total_rmse_v / n).item()
+        avg_vrmse_u = (total_vrmse_u / n).item()
+        avg_vrmse_v = (total_vrmse_v / n).item()
         avg_rmse = (total_rmse / n).item()
+        avg_vrmse_all = (total_vrmse_all / n).item()
+        avg_nrmse_all = (total_nrmse_all / n).item()
     else:
-        avg_pde = avg_rmse_u = avg_rmse_v = avg_rmse = 0.0
+        avg_pde = avg_rmse_u = avg_rmse_v = avg_vrmse_u = avg_vrmse_v = avg_rmse = 0.0
+        avg_vrmse_all = avg_nrmse_all = 0.0
 
     return {
         'pde': avg_pde,
         'rmse_u': avg_rmse_u,
         'rmse_v': avg_rmse_v,
+        'vrmse_u': avg_vrmse_u,
+        'vrmse_v': avg_vrmse_v,
         'rmse': avg_rmse,
+        'vrmse_all': avg_vrmse_all,
+        'nrmse_all': avg_nrmse_all,
         'num_batches': int(n),
     }
 
@@ -265,6 +318,10 @@ def run_visualization(model, dataset, config, device, t_input, num_samples, seed
     results = []
     all_rmse_u = []
     all_rmse_v = []
+    all_vrmse_u = []
+    all_vrmse_v = []
+    all_vrmse_all = []
+    all_nrmse_all = []
     all_pde_loss = []
 
     for i, sample_idx in enumerate(sample_indices):
@@ -294,6 +351,18 @@ def run_visualization(model, dataset, config, device, t_input, num_samples, seed
         tgt_v = target[..., 1].float()
         rmse_u = torch.sqrt(torch.mean((out_u - tgt_u) ** 2) + 1e-8).item()
         rmse_v = torch.sqrt(torch.mean((out_v - tgt_v) ** 2) + 1e-8).item()
+        vrmse_u = _vrmse_torch(tgt_u, out_u).item()
+        vrmse_v = _vrmse_torch(tgt_v, out_v).item()
+
+        # Combined vrmse/nrmse across all valid channels
+        valid_ch_vis = [0, 1]
+        output_valid_vis = output[..., valid_ch_vis]
+        target_valid_vis = target[..., valid_ch_vis]
+        mse_all_vis = torch.mean((output_valid_vis - target_valid_vis) ** 2)
+        var_all_vis = torch.mean((target_valid_vis - target_valid_vis.mean()) ** 2)
+        vrmse_all_vis = torch.sqrt(mse_all_vis / (var_all_vis + 1e-8)).item()
+        mse_zero_all_vis = torch.mean(target_valid_vis ** 2)
+        nrmse_all_vis = torch.sqrt(mse_all_vis / (mse_zero_all_vis + 1e-8)).item()
 
         # Last timestep for plotting
         gt_u = target[0, -1, :, :, 0].float().cpu().numpy()
@@ -312,12 +381,19 @@ def run_visualization(model, dataset, config, device, t_input, num_samples, seed
 
         all_rmse_u.append(rmse_u)
         all_rmse_v.append(rmse_v)
+        all_vrmse_u.append(vrmse_u)
+        all_vrmse_v.append(vrmse_v)
+        all_vrmse_all.append(vrmse_all_vis)
+        all_nrmse_all.append(nrmse_all_vis)
         all_pde_loss.append(pde_loss)
 
         last_rmse_u = np.sqrt(np.mean((pred_u - gt_u)**2))
         last_rmse_v = np.sqrt(np.mean((pred_v - gt_v)**2))
+        last_vrmse_u = _vrmse_np(gt_u, pred_u)
+        last_vrmse_v = _vrmse_np(gt_v, pred_v)
         print(f"  Sample {sample_idx}: nu={nu:.3f}, t_start={start_t}, "
-              f"RMSE_u={last_rmse_u:.4f}, RMSE_v={last_rmse_v:.4f}, PDE={pde_loss:.2f}")
+              f"RMSE_u={last_rmse_u:.4f}, VRMSE_u={last_vrmse_u:.4f}, "
+              f"RMSE_v={last_rmse_v:.4f}, VRMSE_v={last_vrmse_v:.4f}, PDE={pde_loss:.2f}")
 
     output_filename = "visualization_burgers_lora.png"
     print("Plotting visualization...")
@@ -328,9 +404,13 @@ def run_visualization(model, dataset, config, device, t_input, num_samples, seed
     print("=" * 60)
     print(f"Output: {output_dir / output_filename}")
     print(f"\nAverage Metrics ({len(results)} samples):")
-    print(f"  - RMSE (u): {np.mean(all_rmse_u):.6f}")
-    print(f"  - RMSE (v): {np.mean(all_rmse_v):.6f}")
-    print(f"  - PDE Loss: {np.mean(all_pde_loss):.2f}")
+    print(f"  - RMSE  (u): {np.mean(all_rmse_u):.6f}")
+    print(f"  - VRMSE (u): {np.mean(all_vrmse_u):.6f}")
+    print(f"  - RMSE  (v): {np.mean(all_rmse_v):.6f}")
+    print(f"  - VRMSE (v): {np.mean(all_vrmse_v):.6f}")
+    print(f"  - VRMSE (all): {np.mean(all_vrmse_all):.6f}")
+    print(f"  - nRMSE (all): {np.mean(all_nrmse_all):.6f}")
+    print(f"  - PDE Loss:  {np.mean(all_pde_loss):.2f}")
     print("=" * 60)
 
 
@@ -368,7 +448,8 @@ def plot_results(results: list, save_path: str):
         im1 = axes[row, 1].imshow(pred_u, origin='lower', extent=extent, cmap='jet',
                                     vmin=vmin_u, vmax=vmax_u)
         rmse_u = np.sqrt(np.mean((pred_u - gt_u)**2))
-        axes[row, 1].set_title(f'Pred u (RMSE={rmse_u:.4f})', fontsize=11)
+        vrmse_u = _vrmse_np(gt_u, pred_u)
+        axes[row, 1].set_title(f'Pred u (RMSE={rmse_u:.4f} VRMSE={vrmse_u:.4f})', fontsize=11)
         plt.colorbar(im1, ax=axes[row, 1], fraction=0.046, pad=0.04)
 
         res_u_max = np.percentile(np.abs(res_u), 95)
@@ -391,7 +472,8 @@ def plot_results(results: list, save_path: str):
         im4 = axes[row, 4].imshow(pred_v, origin='lower', extent=extent, cmap='jet',
                                     vmin=vmin_v, vmax=vmax_v)
         rmse_v = np.sqrt(np.mean((pred_v - gt_v)**2))
-        axes[row, 4].set_title(f'Pred v (RMSE={rmse_v:.4f})', fontsize=11)
+        vrmse_v = _vrmse_np(gt_v, pred_v)
+        axes[row, 4].set_title(f'Pred v (RMSE={rmse_v:.4f} VRMSE={vrmse_v:.4f})', fontsize=11)
         plt.colorbar(im4, ax=axes[row, 4], fraction=0.046, pad=0.04)
 
         res_v_max = np.percentile(np.abs(res_v), 95)
@@ -483,10 +565,14 @@ def main():
         if is_main:
             print(f"\n{'='*60}")
             print(f"Results ({results['num_batches']} batches across all ranks):")
-            print(f"  PDE Loss:  {results['pde']:.6f}")
-            print(f"  RMSE (u):  {results['rmse_u']:.6f}")
-            print(f"  RMSE (v):  {results['rmse_v']:.6f}")
-            print(f"  RMSE:      {results['rmse']:.6f}")
+            print(f"  PDE Loss:   {results['pde']:.6f}")
+            print(f"  RMSE  (u):  {results['rmse_u']:.6f}")
+            print(f"  VRMSE (u):  {results['vrmse_u']:.6f}")
+            print(f"  RMSE  (v):  {results['rmse_v']:.6f}")
+            print(f"  VRMSE (v):  {results['vrmse_v']:.6f}")
+            print(f"  VRMSE (all): {results['vrmse_all']:.6f}")
+            print(f"  nRMSE (all): {results['nrmse_all']:.6f}")
+            print(f"  RMSE:       {results['rmse']:.6f}")
             print(f"{'='*60}")
 
     # ---- Visualization (main process only) ----

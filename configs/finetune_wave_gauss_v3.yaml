@@ -1,0 +1,115 @@
+# Wave-Gauss Acoustic Wave Equation LoRA Finetuning Configuration (V3 Model)
+# Acoustic wave equation with spatially-varying wave speed, absorbing BC
+# Loss: BC (boundary supervised) + PDE (wave equation residual)
+# Channels: u(3) = scalar[0] = displacement, c(4) = scalar[1] = wave speed
+# No velocity fields (vector_dim=0)
+
+model_name: wave_gauss_lora_v3
+
+model:
+  # Must match pretrained V3s model architecture
+  in_channels: 18
+  hidden_dim: 768
+  patch_size: 16
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+  encoder:
+    stem_hidden: 128
+    stem_out: 256
+    use_cnn_pool: false
+
+  intra_patch:
+    num_layers: 2
+    temporal_window: 3
+    num_heads: 8
+
+  na:
+    base_kernel: 5
+
+  decoder:
+    stem_channels: 256
+    hidden_channels: 128
+    post_smooth_kernel: 5
+
+  vector_channels: 3
+  scalar_channels: 15
+
+  enable_1d: false
+  enable_3d: false
+
+  pretrained_path: ./checkpoints_v4_2donly_postsmooth/best_tf.pt
+  gradient_checkpointing: true
+
+  freeze_encoder: false
+  freeze_decoder: false
+
+  # LoRA configuration
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - qkv
+      - proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+training:
+  max_epochs: 30
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  warmup_steps: 500
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+  # Loss weights: BC (supervised) + PDE (physics), NO RMSE
+  lambda_bc: 10000.0     # Boundary RMSE (supervised anchor, 4 edges)
+  lambda_pde: 1.0        # PDE residual loss (per-equation normalized)
+
+  # Save criterion: save_vrmse_weight * val_vrmse + save_pde_weight * val_pde
+  save_vrmse_weight: 100
+  save_pde_weight: 1
+
+  eval_interval: 1000
+  early_stopping_patience: 30
+
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+
+dataloader:
+  batch_size: 28           # 128x128 is small
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: /scratch-share/SONG0304/finetune/wave_gauss_small.hdf5
+  seed: 42
+  t_input: 8
+  train_ratio: 0.9
+  clips_per_sample: 6     # 15 frames, temporal_length=9, max ~6 clips
+  val_time_interval: 1
+  vector_dim: 0            # No velocity fields!
+
+logging:
+  project: pde-wave-gauss-lora
+  entity: null
+  save_dir: ./checkpoints_wave_gauss_lora_v3
+  log_interval: 10
+
+checkpoint:
+  resume_from: null
+
+physics:
+  nx: 128
+  ny: 128
+  Lx: 1.0
+  Ly: 1.0
+  dt: 0.066666667          # 1.0/15 (16 snapshots from t=0 to t=1)
+  skip_boundary: 2
+  # Per-equation normalization (GT RMS from test_gt_pde_wave_gauss.py, u_tt/c² - ∇²u form)
+  eq_scales:
+    wave: 90.63

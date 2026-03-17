@@ -1,0 +1,115 @@
+# Turbulent Radiative Layer 2D LoRA Finetuning Configuration
+# Compressible Euler: mass + momentum conservation (no energy)
+# x periodic, y open (Neumann), multiple tcool values
+# Channels: Vx(0), Vy(1), density(7), pressure(15)
+# Loss: BC (supervised anchor) + PDE (mass + x-mom + y-mom)
+
+model_name: turbulent_radiative_lora_v3
+
+model:
+  in_channels: 18
+  hidden_dim: 768
+  patch_size: 16
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+  encoder:
+    stem_hidden: 128
+    stem_out: 256
+    use_cnn_pool: false
+
+  intra_patch:
+    num_layers: 2
+    temporal_window: 3
+    num_heads: 8
+
+  na:
+    base_kernel: 5
+
+  decoder:
+    version: 'v3'
+    stem_channels: 256
+    hidden_channels: 256
+    use_skip: true
+    cross_patch:
+      enabled: true
+      kernel_size: 3
+      num_layers: 2
+
+  vector_channels: 3
+  scalar_channels: 15
+
+  enable_1d: false
+  enable_3d: false
+
+  # Pretrained V4 2D-only checkpoint (decoder v3: skip + cross-patch)
+  pretrained_path: ./checkpoints_v4_2donly_dec_v3/best_tf.pt
+  gradient_checkpointing: true
+
+  freeze_encoder: false
+  freeze_decoder: false
+
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - qkv
+      - proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+training:
+  max_epochs: 30
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  warmup_steps: 50
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+  lambda_bc: 100.0
+  lambda_pde: 1
+
+  # Save criterion: save_rmse_weight * val_rmse + save_pde_weight * val_pde
+  save_rmse_weight: 100
+  save_pde_weight: 1
+
+  eval_interval: 100
+  early_stopping_patience: 30
+
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+
+dataloader:
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: ./data/finetune/turbulent_radiative_layer.h5
+  seed: 42
+  t_input: 8
+  train_ratio: 0.9
+  clips_per_sample: 80
+  val_time_interval: 10
+  vector_dim: 2
+
+logging:
+  project: pde-turbulent-radiative-lora
+  entity: null
+  save_dir: ./checkpoints_turbulent_radiative_lora_v3
+  log_interval: 10
+
+checkpoint:
+  resume_from: null
+
+physics:
+  nx: 128
+  ny: 384
+  Lx: 1.0
+  Ly: 3.0
+  dt: 1.597033
+  skip_bl: 10

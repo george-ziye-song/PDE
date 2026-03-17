@@ -1,0 +1,128 @@
+# Shear Flow LoRA Finetuning Configuration (V3 Model)
+# Incompressible NS + Tracer Transport, doubly periodic
+# Loss: BC (supervised anchor) + PDE (continuity + momentum + tracer, per-equation normalized)
+# Channels: Vx(0), Vy(1), tracer(14), pressure(15)
+
+model_name: shear_flow_lora_v3
+
+model:
+  # Must match pretrained V3s model architecture
+  in_channels: 18
+  hidden_dim: 768
+  patch_size: 16
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+  encoder:
+    stem_hidden: 128
+    stem_out: 256
+    use_cnn_pool: false
+
+  intra_patch:
+    num_layers: 2
+    temporal_window: 3
+    num_heads: 8
+
+  na:
+    base_kernel: 5
+
+  decoder:
+    version: 'v3'
+    stem_channels: 256
+    hidden_channels: 256
+    use_skip: true
+    cross_patch:
+      enabled: true
+      kernel_size: 3
+      num_layers: 2
+
+  vector_channels: 3
+  scalar_channels: 15
+
+  # Shear flow is 2D
+  enable_1d: false
+  enable_3d: false
+
+  # Pretrained V4 2D-only checkpoint (decoder v3: skip + cross-patch)
+  pretrained_path: ./checkpoints_v4_2donly_dec_v3/best_tf.pt
+  gradient_checkpointing: true
+
+  # Freeze options
+  freeze_encoder: false
+  freeze_decoder: false
+
+  # LoRA configuration
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - qkv
+      - proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+training:
+  max_epochs: 30
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  warmup_steps: 200
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+  # Loss weights: BC (supervised) + PDE (physics), NO RMSE
+  lambda_bc: 10000.0     # Boundary RMSE (supervised anchor, 4 edges)
+  lambda_pde: 1.0        # PDE residual loss (per-equation normalized)
+
+  # Save criterion: save_rmse_weight * val_rmse + save_pde_weight * val_pde
+  save_rmse_weight: 1000
+  save_pde_weight: 1
+
+  eval_interval: 80
+  early_stopping_patience: 30
+
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+
+dataloader:
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: ./data/finetune/shear_flow_clean.h5
+  seed: 42
+  t_input: 8
+  train_ratio: 0.9
+  clips_per_sample: 200
+  val_time_interval: 4
+  vector_dim: 2              # 2D velocity (Vx, Vy)
+
+logging:
+  project: pde-shear-flow-lora
+  entity: null
+  save_dir: ./checkpoints_shear_flow_lora_v3_postsmooth
+  log_interval: 10
+
+checkpoint:
+  resume_from: null
+
+physics:
+  nx: 256
+  ny: 512
+  Lx: 1.0
+  Ly: 2.0
+  dt: 0.1
+  nu: 1.0e-4      # 1/Re, Re=10000
+  D: 1.0e-3        # nu/Sc, Sc=0.1
+
+  # Per-equation normalization scales (GT RMS, from test_gt_pde_shear_flow.py)
+  # TODO: run GT test with NPINN formulation to get actual values
+  # eq_scales:
+  #   continuity: 1.0      # placeholder
+  #   u_momentum: 1.0      # placeholder
+  #   v_momentum: 1.0      # placeholder
+  #   tracer: 1.0           # placeholder

@@ -259,6 +259,8 @@ def main():
     grad_clip = config['training'].get('grad_clip', 1.0)
     eval_interval = config['training'].get('eval_interval', 100)
     early_stopping_patience = config['training'].get('early_stopping_patience', 15)
+    save_rmse_weight = config['training'].get('save_rmse_weight', 100.0)
+    save_pde_weight = config['training'].get('save_pde_weight', 1.0)
     t_input = config['dataset'].get('t_input', 8)
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -462,8 +464,9 @@ def main():
                         )
 
                     if not in_warmup:
-                        if val_loss < best_val_loss:
-                            best_val_loss = val_loss
+                        save_metric = save_rmse_weight * val_rmse + save_pde_weight * val_pde
+                        if save_metric < best_val_loss:
+                            best_val_loss = save_metric
                             patience_counter = 0
                             if accelerator.is_main_process:
                                 save_lora_checkpoint(

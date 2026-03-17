@@ -1,0 +1,122 @@
+# Heat 3D LoRA Finetuning Configuration (V4 Model with 3D support)
+# 3D Heat Equation: du/dt = alpha * laplacian(u), periodic boundary
+# Loss: BC (supervised anchor on 6 faces) + PDE (heat equation)
+# Channels: temperature(17), no velocity (vector_dim=0)
+# Per-sample alpha (thermal diffusivity)
+
+model_name: heat_3d_lora_v4
+
+model:
+  # Must match V4 pretrained model architecture
+  in_channels: 18
+  hidden_dim: 768
+  patch_size: 16
+  patch_size_3d: 16
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+  encoder:
+    stem_hidden: 128
+    stem_out: 256
+    use_cnn_pool: false
+
+  intra_patch:
+    num_layers: 2
+    temporal_window: 3
+    num_heads: 8
+
+  na:
+    base_kernel: 5
+    # 128/16=8 patches per dim; base_kernel=5 fits, no override needed
+
+  decoder:
+    stem_channels: 256
+    hidden_channels: 128
+
+  vector_channels: 3
+  scalar_channels: 15
+
+  # Heat 3D: only 3D encoder/decoder needed
+  enable_1d: false
+  enable_2d: false
+  enable_3d: true
+  gradient_checkpointing: true
+
+  # V4 pretrained checkpoint (trained with 3D data)
+  pretrained_path: ./checkpoints_v4_s_3d_with_best1-2d/best_tf.pt
+
+  # Freeze options
+  freeze_encoder: false
+  freeze_decoder: false
+
+  # LoRA configuration
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - qkv
+      - proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+training:
+  max_epochs: 30
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  warmup_steps: 0
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+  # Loss weights
+  lambda_bc: 1.0    # Boundary loss weight (6-face supervised anchor)
+  lambda_pde: 0.1   # PDE loss weight
+
+  # Save criterion: save_rmse_weight * val_rmse + save_pde_weight * val_pde
+  save_rmse_weight: 100
+  save_pde_weight: 1
+
+  # Eval interval (steps)
+  eval_interval: 120
+
+  # Early stopping
+  early_stopping_patience: 30
+
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+
+dataloader:
+  batch_size: 1        # 128^3 * 18ch is very large
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: ./data/finetune/heat_3d_128.h5
+  seed: 42
+  t_input: 8
+  train_ratio: 0.9
+  clips_per_sample: null
+  val_time_interval: 8
+  vector_dim: 0              # No velocity, temperature only
+
+logging:
+  project: pde-heat-3d-lora
+  entity: null
+  save_dir: ./checkpoints_heat_3d_lora_v4
+  log_interval: 10
+
+checkpoint:
+  resume_from: null
+
+physics:
+  nx: 128
+  ny: 128
+  nz: 128
+  Lx: 6.283185307179586    # 2*pi
+  Ly: 6.283185307179586    # 2*pi
+  Lz: 6.283185307179586    # 2*pi
+  dt: 0.01
+  alpha_default: 0.01      # fallback; per-sample alpha from dataset

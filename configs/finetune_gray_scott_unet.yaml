@@ -1,0 +1,60 @@
+# Gray-Scott UNet Baseline (train from scratch)
+# Same loss: BC + PDE + stochastic RMSE anchor
+# Purpose: verify if PDE loss is small early for any model, not just ours
+
+model:
+  init_features: 32   # UNet2d init_features (total ~7.8M params)
+
+training:
+  max_epochs: 30
+  learning_rate: 1.0e-3      # Higher LR for from-scratch training
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  warmup_steps: 100
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+  # Same loss weights as LoRA version
+  lambda_bc: 1000     # Boundary loss weight (supervised anchor)
+  lambda_pde: 1       # PDE loss weight
+
+  # No RMSE supervision — pure BC + PDE only
+  rmse_prob: 0.0
+  lambda_rmse: 0.0
+
+  eval_interval: 200
+  early_stopping_patience: 30
+
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+
+dataloader:
+  batch_size: 32       # UNet is much smaller, can use larger batch
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: /scratch-share/SONG0304/finetune/gray_scott_test.h5
+  seed: 42
+  t_input: 8
+  train_ratio: 0.9
+  clips_per_sample: null
+  val_time_interval: 2
+  vector_dim: 0
+
+logging:
+  project: pde-gray-scott-unet-baseline
+  entity: null
+  save_dir: ./checkpoints_gray_scott_unet
+  log_interval: 10
+
+physics:
+  nx: 128
+  ny: 128
+  dx: 0.015748031    # 2.0157 / 128
+  dy: 0.015748031
+  dt: 10.0
+  F: 0.098
+  k: 0.057
+  D_A: 1.81e-5
+  D_B: 1.39e-5

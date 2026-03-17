@@ -27,6 +27,13 @@ from pde_loss_flow import flow_mixing_pde_loss
 from pde_loss_flow_v2 import flow_mixing_pde_loss_v2
 
 
+def _vrmse_np(gt: np.ndarray, pred: np.ndarray, eps: float = 1e-8) -> float:
+    """Variance-normalized RMSE."""
+    mse = np.mean((pred - gt) ** 2)
+    var = np.mean((gt - gt.mean()) ** 2)
+    return float(np.sqrt(mse / (var + eps)))
+
+
 def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
@@ -232,7 +239,8 @@ def plot_single_timestep(
     # 2. Prediction
     im1 = axes[1].imshow(pred_np, origin='lower', extent=extent, cmap='jet', vmin=vmin, vmax=vmax)
     pred_rmse = np.sqrt(np.mean((pred_np - gt_np)**2))
-    axes[1].set_title(f'Prediction (RMSE={pred_rmse:.4f})', fontsize=12)
+    pred_vrmse = _vrmse_np(gt_np, pred_np)
+    axes[1].set_title(f'Prediction (RMSE={pred_rmse:.4f} VRMSE={pred_vrmse:.4f})', fontsize=12)
     axes[1].set_xlabel('x')
     axes[1].set_ylabel('y')
     plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
@@ -302,7 +310,8 @@ def plot_multiple_samples(
         # 2. Prediction
         im1 = axes[row, 1].imshow(pred_np, origin='lower', extent=extent, cmap='jet', vmin=vmin, vmax=vmax)
         pred_rmse = np.sqrt(np.mean((pred_np - gt_np)**2))
-        axes[row, 1].set_title(f'Prediction (RMSE={pred_rmse:.4f})', fontsize=11)
+        pred_vrmse = _vrmse_np(gt_np, pred_np)
+        axes[row, 1].set_title(f'Prediction (RMSE={pred_rmse:.4f} VRMSE={pred_vrmse:.4f})', fontsize=11)
         axes[row, 1].set_xlabel('x')
         plt.colorbar(im1, ax=axes[row, 1], fraction=0.046, pad=0.04)
 
@@ -449,6 +458,7 @@ def main():
 
     results = []
     all_rmse = []
+    all_vrmse = []
     all_pde_mse = []
 
     for i, sample_idx in enumerate(sample_indices):
@@ -502,10 +512,12 @@ def main():
 
         # Metrics
         rmse = np.sqrt(np.mean((pred_last - gt_last)**2))
+        vrmse = _vrmse_np(gt_last, pred_last)
         all_rmse.append(rmse)
+        all_vrmse.append(vrmse)
         all_pde_mse.append(pde_mse)
 
-        print(f"  Sample {sample_idx}: vtmax={vtmax:.2f}, RMSE={rmse:.4f}, PDE_MSE={pde_mse:.2f}")
+        print(f"  Sample {sample_idx}: vtmax={vtmax:.2f}, RMSE={rmse:.4f}, VRMSE={vrmse:.4f}, PDE_MSE={pde_mse:.2f}")
 
     # Plot all samples
     output_filename = f"visualization_{model_suffix}.png"
@@ -522,6 +534,7 @@ def main():
     print(f"Output: {output_dir / output_filename}")
     print(f"\nAverage Metrics ({len(results)} samples):")
     print(f"  - RMSE (pred vs gt): {np.mean(all_rmse):.6f}")
+    print(f"  - VRMSE (pred vs gt): {np.mean(all_vrmse):.6f}")
     print(f"  - PDE Loss (MSE): {np.mean(all_pde_mse):.2f}")
     print("=" * 60)
 

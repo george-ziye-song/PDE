@@ -138,6 +138,7 @@ class PatchifyDecoder(nn.Module):
         patch_size: int = 16,
         stem_channels: int = 256,
         decoder_hidden: int = 128,
+        post_smooth_kernel: int = 0,
     ):
         super().__init__()
         self.out_channels = out_channels
@@ -155,6 +156,29 @@ class PatchifyDecoder(nn.Module):
             hidden_channels=decoder_hidden,
             out_channels=out_channels,
         )
+
+        # Post-assembly smoothing: Conv at full resolution for cross-patch boundary
+        if post_smooth_kernel > 0:
+            pad = post_smooth_kernel // 2
+            self.post_smooth = nn.Conv2d(
+                out_channels, out_channels, kernel_size=post_smooth_kernel,
+                padding=pad, padding_mode='replicate',
+            )
+            self._identity_init_post_smooth()
+
+    def _identity_init_post_smooth(self) -> None:
+        """Identity-init: delta kernel at center → output = input."""
+        nn.init.zeros_(self.post_smooth.weight)
+        nn.init.zeros_(self.post_smooth.bias)
+        center = self.post_smooth.kernel_size[0] // 2
+        with torch.no_grad():
+            for c in range(self.out_channels):
+                self.post_smooth.weight[c, c, center, center] = 1.0
+
+    def reinit_identity(self) -> None:
+        """Re-apply identity init after model._init_weights() overwrites Conv2d."""
+        if hasattr(self, 'post_smooth'):
+            self._identity_init_post_smooth()
 
     def forward(self, x: torch.Tensor, shape_info: Dict) -> torch.Tensor:
         """
@@ -191,6 +215,13 @@ class PatchifyDecoder(nn.Module):
         x = x.permute(0, 1, 2, 5, 3, 6, 4)
         # -> [B, T, H, W, C]
         x = x.reshape(B, T, H, W, self.out_channels)
+
+        # Step 5: Post-assembly smoothing (cross-patch boundary)
+        if hasattr(self, 'post_smooth'):
+            # [B, T, H, W, C] -> [B*T, C, H, W] for Conv2d
+            x = x.reshape(B * T, H, W, self.out_channels).permute(0, 3, 1, 2)
+            x = self.post_smooth(x)
+            x = x.permute(0, 2, 3, 1).reshape(B, T, H, W, self.out_channels)
 
         return x
 

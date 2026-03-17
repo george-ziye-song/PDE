@@ -21,6 +21,27 @@ from pde_loss_flow_v2 import flow_mixing_pde_loss_v2
 from model_lora import PDELoRAModel, load_lora_checkpoint
 
 
+def _vrmse_np(gt: np.ndarray, pred: np.ndarray, eps: float = 1e-8) -> float:
+    """Variance-normalized RMSE."""
+    mse = np.mean((pred - gt) ** 2)
+    var = np.mean((gt - gt.mean()) ** 2)
+    return float(np.sqrt(mse / (var + eps)))
+
+
+def _vrmse_torch(gt: torch.Tensor, pred: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Variance-normalized RMSE (torch)."""
+    mse = torch.mean((pred - gt) ** 2)
+    var = torch.mean((gt - gt.mean()) ** 2)
+    return torch.sqrt(mse / (var + eps))
+
+
+def _nrmse_torch(gt: torch.Tensor, pred: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """nRMSE: sqrt(MSE(pred, gt) / MSE(0, gt))."""
+    mse_pred = torch.mean((pred - gt) ** 2)
+    mse_zero = torch.mean(gt ** 2)
+    return torch.sqrt(mse_pred / (mse_zero + eps))
+
+
 def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
@@ -157,6 +178,15 @@ def compute_rmse_loss(output: torch.Tensor, target: torch.Tensor, channel: int =
     return rmse.item()
 
 
+def compute_vrmse_loss(output: torch.Tensor, target: torch.Tensor, channel: int = 0) -> float:
+    """Compute VRMSE for a specific channel."""
+    out_ch = output[..., channel].float()
+    tgt_ch = target[..., channel].float()
+    mse = torch.mean((out_ch - tgt_ch) ** 2)
+    var = torch.mean((tgt_ch - tgt_ch.mean()) ** 2)
+    return torch.sqrt(mse / (var + 1e-8)).item()
+
+
 def plot_results(
     results: list,
     save_path: str,
@@ -193,7 +223,8 @@ def plot_results(
         # 2. Prediction
         im1 = axes[row, 1].imshow(pred_np, origin='lower', extent=extent, cmap='jet', vmin=vmin, vmax=vmax)
         pred_rmse = np.sqrt(np.mean((pred_np - gt_np)**2))
-        axes[row, 1].set_title(f'Prediction (RMSE={pred_rmse:.4f})', fontsize=11)
+        pred_vrmse = _vrmse_np(gt_np, pred_np)
+        axes[row, 1].set_title(f'Prediction (RMSE={pred_rmse:.4f} VRMSE={pred_vrmse:.4f})', fontsize=11)
         axes[row, 1].set_xlabel('x')
         plt.colorbar(im1, ax=axes[row, 1], fraction=0.046, pad=0.04)
 
@@ -264,6 +295,9 @@ def main():
 
     results = []
     all_rmse = []
+    all_vrmse = []
+    all_vrmse_all = []
+    all_nrmse_all = []
     all_pde_mse = []
 
     for i, sample_idx in enumerate(sample_indices):
@@ -289,8 +323,19 @@ def main():
             device=device,
         )
 
-        # Compute RMSE (exactly like train_flow_lora.py)
+        # Compute RMSE and VRMSE (exactly like train_flow_lora.py)
         rmse = compute_rmse_loss(output, target)
+        vrmse = compute_vrmse_loss(output, target)
+
+        # Combined vrmse/nrmse across all valid channels (channel 0 = u)
+        valid_ch_vis = [0]
+        output_valid_vis = output[..., valid_ch_vis]
+        target_valid_vis = target[..., valid_ch_vis]
+        mse_all_vis = torch.mean((output_valid_vis - target_valid_vis) ** 2)
+        var_all_vis = torch.mean((target_valid_vis - target_valid_vis.mean()) ** 2)
+        vrmse_all_vis = torch.sqrt(mse_all_vis / (var_all_vis + 1e-8)).item()
+        mse_zero_all_vis = torch.mean(target_valid_vis ** 2)
+        nrmse_all_vis = torch.sqrt(mse_all_vis / (mse_zero_all_vis + 1e-8)).item()
 
         # Get last timestep for visualization
         gt_last = target[0, -1, :, :, 0].float().cpu().numpy()
@@ -306,12 +351,16 @@ def main():
         })
 
         all_rmse.append(rmse)
+        all_vrmse.append(vrmse)
+        all_vrmse_all.append(vrmse_all_vis)
+        all_nrmse_all.append(nrmse_all_vis)
         all_pde_mse.append(pde_mse)
 
         # Per-sample metrics (last timestep only for display)
         last_rmse = np.sqrt(np.mean((pred_last - gt_last)**2))
+        last_vrmse = _vrmse_np(gt_last, pred_last)
         last_pde_mse = np.mean(res_last**2)
-        print(f"  Sample {sample_idx}: vtmax={vtmax:.2f}, RMSE={last_rmse:.4f}, PDE_MSE(last)={last_pde_mse:.2f}, PDE_MSE(all)={pde_mse:.2f}")
+        print(f"  Sample {sample_idx}: vtmax={vtmax:.2f}, RMSE={last_rmse:.4f}, VRMSE={last_vrmse:.4f}, PDE_MSE(last)={last_pde_mse:.2f}, PDE_MSE(all)={pde_mse:.2f}")
 
     # Plot results
     output_filename = "visualization_lora.png"
@@ -325,6 +374,9 @@ def main():
     print(f"Output: {output_dir / output_filename}")
     print(f"\nAverage Metrics ({len(results)} samples):")
     print(f"  - RMSE (all 16 timesteps): {np.mean(all_rmse):.6f}")
+    print(f"  - VRMSE (all 16 timesteps): {np.mean(all_vrmse):.6f}")
+    print(f"  - VRMSE (all): {np.mean(all_vrmse_all):.6f}")
+    print(f"  - nRMSE (all): {np.mean(all_nrmse_all):.6f}")
     print(f"  - PDE Loss (MSE, all 16 timesteps): {np.mean(all_pde_mse):.2f}")
     print("=" * 60)
 

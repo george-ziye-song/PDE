@@ -1,0 +1,80 @@
+# V4 Pretraining - Post-Smooth 5×5, Frozen Encoder+Transformer, Decoder-only
+# Only train decoder (V2 CNN + post_smooth 5×5) on diffusion_reaction
+# 4 GPU test run
+
+model_name: pde_v4_tf_s_3d
+
+model:
+  in_channels: 18
+  hidden_dim: 768
+  patch_size: 16
+  patch_size_3d: 16
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+  encoder:
+    stem_hidden: 128
+    stem_out: 256
+    use_cnn_pool: false
+
+  intra_patch:
+    num_layers: 2
+    temporal_window: 3
+    num_heads: 8
+
+  na:
+    base_kernel: 5
+
+  decoder:
+    stem_channels: 256
+    hidden_channels: 128
+    post_smooth_kernel: 5
+
+  vector_channels: 3
+  scalar_channels: 15
+
+  enable_1d: false
+  enable_3d: false
+  gradient_checkpointing: true
+
+training:
+  use_fsdp: false
+  freeze_encoder_transformer: true
+  max_epochs: 20
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  warmup_steps: 200
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  eval_interval: 95
+  early_stopping_patience: 50
+  mixed_precision: "no"
+  use_compile: false
+  gradient_accumulation_steps: 1
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: /scratch-share/SONG0304
+  seed: 42
+  t_input: 8
+
+  overrides:
+    diffusion_reaction:
+      clips_per_epoch: null
+      val_clips: 47
+
+logging:
+  project: pde-foundation-v4_2donly_postsmooth_frozen
+  entity: null
+  save_dir: ./checkpoints_v4_2donly_postsmooth_frozen
+  log_interval: 10
+
+checkpoint:
+  resume_from: null
+  init_from: /home/msai/song0304/code/PDE/checkpoints_v4_2donly/best_tf.pt

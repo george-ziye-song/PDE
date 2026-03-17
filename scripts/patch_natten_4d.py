@@ -244,7 +244,7 @@ def patch_flex_configs(natten_path):
 
 
 def patch_flex_backend(natten_path):
-    """Add 4D type imports to flex backend."""
+    """Add 4D type imports and fix return_lse deprecation in flex backend."""
     filepath = os.path.join(natten_path, "backends", "flex.py")
     patch_file(filepath, [
         (
@@ -262,7 +262,44 @@ def patch_flex_backend(natten_path):
             "    Dimension4DTypeOrDed,\n"
             "    DimensionType,",
         ),
-    ], "(4D type imports)")
+        # Fix return_lse deprecation (PyTorch 2.9+: use return_aux=AuxRequest)
+        (
+            "from torch.nn.attention.flex_attention import (\n"
+            "    BlockMask,\n"
+            "    create_block_mask,\n"
+            "    flex_attention,\n"
+            ")",
+            "from torch.nn.attention.flex_attention import (\n"
+            "    AuxRequest,\n"
+            "    BlockMask,\n"
+            "    create_block_mask,\n"
+            "    flex_attention,\n"
+            ")",
+        ),
+        (
+            "    return flex_fn(\n"
+            "        q,\n"
+            "        k,\n"
+            "        v,\n"
+            "        block_mask=block_mask,\n"
+            "        return_lse=True,\n"
+            "        scale=scale,\n"
+            "        kernel_options=kernel_options,\n"
+            "        enable_gqa=is_gqa,\n"
+            "    )",
+            "    out, aux = flex_fn(\n"
+            "        q,\n"
+            "        k,\n"
+            "        v,\n"
+            "        block_mask=block_mask,\n"
+            "        return_aux=AuxRequest(lse=True),\n"
+            "        scale=scale,\n"
+            "        kernel_options=kernel_options,\n"
+            "        enable_gqa=is_gqa,\n"
+            "    )\n"
+            "    return out, aux.lse",
+        ),
+    ], "(4D type imports + return_lse fix)")
 
 
 def patch_functional(natten_path):

@@ -31,6 +31,7 @@ from pretrain.encoder_v2 import (
 from pretrain.decoder_v2 import (
     PatchifyDecoder, PatchifyDecoder1D, PatchifyDecoder3D,
 )
+from pretrain.decoder_v3 import PatchifyDecoderV2
 
 
 class SharedNATransformerLayer(nn.Module):
@@ -49,6 +50,7 @@ class SharedNATransformerLayer(nn.Module):
         dropout: float = 0.0,
         enable_1d: bool = True,
         enable_3d: bool = True,
+        base_kernel_3d: Optional[int] = None,
     ):
         super().__init__()
 
@@ -88,10 +90,12 @@ class SharedNATransformerLayer(nn.Module):
         )
 
         # 3D spatial: NA4D (time + 3 spatial)
+        # base_kernel_3d overrides spatial kernel for 3D (temporal keeps base_kernel)
         if enable_3d:
+            k3d = base_kernel_3d if base_kernel_3d is not None else base_kernel
             self.na_3d = NattenNA4D(
                 embed_dim=hidden_dim, num_heads=num_heads,
-                kernel_size=(base_kernel, base_kernel, base_kernel, base_kernel),
+                kernel_size=(base_kernel, k3d, k3d, k3d),
                 dilation=1, is_causal=(True, False, False, False),
             )
 
@@ -132,6 +136,7 @@ class SharedNATransformer(nn.Module):
         enable_1d: bool = True,
         enable_3d: bool = True,
         gradient_checkpointing: bool = False,
+        base_kernel_3d: Optional[int] = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -146,6 +151,7 @@ class SharedNATransformer(nn.Module):
                 dropout=dropout,
                 enable_1d=enable_1d,
                 enable_3d=enable_3d,
+                base_kernel_3d=base_kernel_3d,
             )
             for _ in range(num_layers)
         ])
@@ -241,11 +247,19 @@ class PDEModelV3(nn.Module):
         self.hidden_dim = model_cfg.get('hidden_dim', 768)
 
         enable_1d = model_cfg.get('enable_1d', True)
+        enable_2d = model_cfg.get('enable_2d', True)
         enable_3d = model_cfg.get('enable_3d', False)
 
-        # 2D encoder/decoder (always enabled)
-        self.encoder = self._build_encoder_2d(config)
-        self.decoder = self._build_decoder_2d(config)
+        # 2D encoder/decoder
+        if enable_2d:
+            self.encoder = self._build_encoder_2d(config)
+            decoder_version = model_cfg.get('decoder', {}).get('version', 'v2')
+            if decoder_version == 'v3':
+                self.decoder = self._build_decoder_2d_v3(config)
+                self._use_skip = True
+            else:
+                self.decoder = self._build_decoder_2d(config)
+                self._use_skip = False
 
         # 1D encoder/decoder
         if enable_1d:
@@ -261,6 +275,10 @@ class PDEModelV3(nn.Module):
         self.transformer = self._build_transformer(config, enable_1d, enable_3d)
 
         self.apply(self._init_weights)
+
+        # Re-apply identity init for decoder v3 (overwritten by _init_weights)
+        if hasattr(self, 'decoder') and hasattr(self.decoder, 'reinit_identity'):
+            self.decoder.reinit_identity()
 
     def _build_encoder_2d(self, config: Dict) -> PatchifyEncoder:
         model_cfg = config.get('model', {})
@@ -316,6 +334,24 @@ class PDEModelV3(nn.Module):
             patch_size=model_cfg.get('patch_size', 16),
             stem_channels=decoder_cfg.get('stem_channels', 256),
             decoder_hidden=decoder_cfg.get('hidden_channels', 128),
+            post_smooth_kernel=decoder_cfg.get('post_smooth_kernel', 0),
+        )
+
+    def _build_decoder_2d_v3(self, config: Dict) -> PatchifyDecoderV2:
+        model_cfg = config.get('model', {})
+        decoder_cfg = model_cfg.get('decoder', {})
+        encoder_cfg = model_cfg.get('encoder', {})
+        return PatchifyDecoderV2(
+            out_channels=model_cfg.get('in_channels', 18),
+            hidden_dim=model_cfg.get('hidden_dim', 768),
+            patch_size=model_cfg.get('patch_size', 16),
+            stem_channels=decoder_cfg.get('stem_channels', 256),
+            decoder_hidden=decoder_cfg.get('hidden_channels', 256),
+            enc_8x8_channels=encoder_cfg.get('stem_hidden', 128),
+            enc_4x4_channels=encoder_cfg.get('stem_out', 256),
+            use_skip=decoder_cfg.get('use_skip', True),
+            cross_patch_cfg=decoder_cfg.get('cross_patch', {'enabled': True}),
+            gradient_checkpointing=model_cfg.get('gradient_checkpointing', False),
         )
 
     def _build_decoder_1d(self, config: Dict) -> PatchifyDecoder1D:
@@ -353,6 +389,7 @@ class PDEModelV3(nn.Module):
             enable_1d=enable_1d,
             enable_3d=enable_3d,
             gradient_checkpointing=model_cfg.get('gradient_checkpointing', False),
+            base_kernel_3d=na_cfg.get('base_kernel_3d', None),
         )
 
     def _init_weights(self, module: nn.Module):
@@ -402,7 +439,10 @@ class PDEModelV3(nn.Module):
             output = self.decoder_1d(tokens, shape_info)
         elif ndim == 5:
             # 2D: [B, T, H, W, C]
-            tokens, shape_info = self.encoder(x_norm)
+            if not hasattr(self, 'encoder'):
+                raise RuntimeError("Received 2D input but enable_2d=False. Set enable_2d: true in config.")
+            use_skip = getattr(self, '_use_skip', False)
+            tokens, shape_info = self.encoder(x_norm, return_intermediates=use_skip)
             tokens = self.transformer(tokens, shape_info)
             output = self.decoder(tokens, shape_info)
         elif ndim == 6:

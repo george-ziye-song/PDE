@@ -76,13 +76,21 @@ class CNNStem(nn.Module):
             ResBlock2D(out_channels),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, return_intermediates: bool = False,
+    ) -> torch.Tensor:
         """
         Args:
             x: [N, C, 16, 16] where N = B*T*n_h*n_w
+            return_intermediates: If True, return (out, intermediates_dict)
         Returns:
             out: [N, out_channels, 4, 4]
+            intermediates (optional): {'feat_8x8': [N, hidden, 8, 8], 'feat_4x4': [N, out, 4, 4]}
         """
+        if return_intermediates:
+            feat_8x8 = self.stem[:3](x)    # Conv, GELU, ResBlock → [N, hidden, 8, 8]
+            feat_4x4 = self.stem[3:](feat_8x8)  # Conv, GELU, ResBlock → [N, out, 4, 4]
+            return feat_4x4, {'feat_8x8': feat_8x8, 'feat_4x4': feat_4x4}
         return self.stem(x)
 
 
@@ -246,14 +254,17 @@ class PatchifyEncoder(nn.Module):
         # Positional encoding
         self.pos_enc = PositionalEncoding2D(hidden_dim)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+    def forward(
+        self, x: torch.Tensor, return_intermediates: bool = False,
+    ) -> Tuple[torch.Tensor, Dict]:
         """
         Args:
             x: [B, T, H, W, C] input tensor
+            return_intermediates: If True, include encoder CNN intermediates in shape_info
 
         Returns:
             tokens: [B, T*n_h*n_w, D] token sequence
-            shape_info: dict with T, n_h, n_w for decoder
+            shape_info: dict with T, n_h, n_w for decoder (+ encoder_intermediates if requested)
         """
         B, T, H, W, C = x.shape
         P = self.patch_size
@@ -273,7 +284,11 @@ class PatchifyEncoder(nn.Module):
         x = x.reshape(B * T * n_h * n_w, C, P, P)
 
         # Step 2: CNN Stem
-        x = self.cnn_stem(x)  # [B*T*n_h*n_w, stem_out, 4, 4] or [.., 1, 1]
+        encoder_intermediates = {}
+        if return_intermediates and not self.use_cnn_pool:
+            x, encoder_intermediates = self.cnn_stem(x, return_intermediates=True)
+        else:
+            x = self.cnn_stem(x)  # [B*T*n_h*n_w, stem_out, 4, 4] or [.., 1, 1]
 
         if self.use_cnn_pool:
             # CNN already pooled to 1x1
@@ -303,6 +318,8 @@ class PatchifyEncoder(nn.Module):
         x = x.reshape(B, T * n_h * n_w, self.hidden_dim)
 
         shape_info = {'T': T, 'n_h': n_h, 'n_w': n_w, 'H': H, 'W': W}
+        if encoder_intermediates:
+            shape_info['encoder_intermediates'] = encoder_intermediates
         return x, shape_info
 
 

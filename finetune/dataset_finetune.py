@@ -93,9 +93,17 @@ class FinetuneDataset(Dataset):
             # New format: has 'vector' as top-level dataset
             if 'vector' in keys:
                 self.format = 'new'
-                self.n_samples = f['vector'].shape[0]
-                self.n_timesteps = f['vector'].shape[1]
-                self.spatial_shape = f['vector'].shape[2:4]  # (H, W)
+                vec_shape = f['vector'].shape
+                self.n_samples = vec_shape[0]
+                self.n_timesteps = vec_shape[1]
+
+                # Auto-detect 2D vs 3D: [N,T,H,W,3]=6D vs [N,T,X,Y,Z,3]=7D
+                if len(vec_shape) == 7:
+                    self.is_3d = True
+                    self.spatial_shape = vec_shape[2:5]  # (X, Y, Z)
+                else:
+                    self.is_3d = False
+                    self.spatial_shape = vec_shape[2:4]  # (H, W)
 
                 # Check for scalar
                 if 'scalar' in f and f['scalar'].shape[-1] > 0:
@@ -105,7 +113,8 @@ class FinetuneDataset(Dataset):
                     self.scalar_channels = 0
                     self.scalar_indices = []
 
-                logger.info(f"Detected NEW format: {self.n_samples} samples, "
+                dim_str = "3D" if self.is_3d else "2D"
+                logger.info(f"Detected NEW format ({dim_str}): {self.n_samples} samples, "
                            f"{self.n_timesteps} timesteps, shape {self.spatial_shape}")
 
             # Old format: numbered groups like '0', '1', ...
@@ -193,8 +202,8 @@ class FinetuneDataset(Dataset):
     def _load_new_format(
         self, f: h5py.File, sample_idx: int, start_t: int, end_t: int
     ) -> Dict[str, torch.Tensor]:
-        """Load from new global array format."""
-        # Load vector: [T, H, W, 3]
+        """Load from new global array format (supports both 2D and 3D)."""
+        # Load vector: [T, H, W, 3] (2D) or [T, X, Y, Z, 3] (3D)
         vector = np.array(f['vector'][sample_idx, start_t:end_t], dtype=np.float32)
 
         # Load scalar if exists
@@ -203,12 +212,13 @@ class FinetuneDataset(Dataset):
         else:
             scalar = None
 
-        # Build 18-channel output
-        T, H, W, C_vec = vector.shape
-        data = np.zeros((T, H, W, TOTAL_CHANNELS), dtype=np.float32)
+        # Build 18-channel output: [..., 18] where ... is spatial dims
+        spatial_shape = vector.shape[:-1]  # (T, H, W) or (T, X, Y, Z)
+        C_vec = vector.shape[-1]
+        data = np.zeros((*spatial_shape, TOTAL_CHANNELS), dtype=np.float32)
 
-        # Vector channels [0:3] - pad to 3 channels if 2D data (Vz=0)
-        data[..., :C_vec] = vector  # Fill actual channels, rest stays 0
+        # Vector channels [0:3] - pad to 3 channels if needed
+        data[..., :C_vec] = vector
 
         # Scalar channels [3:18] - map using scalar_indices
         if scalar is not None and len(self.scalar_indices) > 0:
@@ -218,13 +228,18 @@ class FinetuneDataset(Dataset):
 
         # Channel mask
         channel_mask = np.zeros(TOTAL_CHANNELS, dtype=np.float32)
-        channel_mask[:self.vector_dim] = 1.0  # Vx, Vy (and Vz if 3D)
+        channel_mask[:self.vector_dim] = 1.0
         for idx in self.scalar_indices:
             if idx < NUM_SCALAR_CHANNELS:
                 channel_mask[NUM_VECTOR_CHANNELS + idx] = 1.0
 
-        # Load nu if available
-        nu = f['nu'][sample_idx] if 'nu' in f else 0.0
+        # Load per-sample parameter (nu or alpha)
+        if 'nu' in f:
+            nu = f['nu'][sample_idx]
+        elif 'alpha' in f:
+            nu = f['alpha'][sample_idx]
+        else:
+            nu = 0.0
 
         result = {
             'data': torch.from_numpy(data),
@@ -246,6 +261,12 @@ class FinetuneDataset(Dataset):
             )
             result['boundary_top'] = torch.from_numpy(
                 np.array(f['boundary_top'][sample_idx, start_t:end_t], dtype=np.float32)
+            )
+
+        # Load force field if available (time-invariant, per-sample)
+        if 'force' in f:
+            result['force'] = torch.from_numpy(
+                np.array(f['force'][sample_idx], dtype=np.float32)
             )
 
         return result
@@ -375,13 +396,19 @@ class FinetuneSampler(Sampler):
 
         # Distribute across ranks
         total = len(batches)
-        self.num_batches_per_rank = total // self.num_replicas
-        usable = self.num_batches_per_rank * self.num_replicas
-        self._all_batches = self._all_batches[:usable]
-
-        if self.rank == 0:
-            logger.info(f"FinetuneSampler: {len(self._all_batches)} batches, "
-                       f"{self.num_batches_per_rank} per rank")
+        if total < self.num_replicas and not self.shuffle:
+            # Val mode: too few batches to split across ranks.
+            # Let every rank run all batches; reduce in validate() handles dedup.
+            self.num_batches_per_rank = total
+            if self.rank == 0:
+                logger.info(f"FinetuneSampler (val, no split): {total} batches on every rank")
+        else:
+            self.num_batches_per_rank = total // self.num_replicas
+            usable = self.num_batches_per_rank * self.num_replicas
+            self._all_batches = self._all_batches[:usable]
+            if self.rank == 0:
+                logger.info(f"FinetuneSampler: {len(self._all_batches)} batches, "
+                           f"{self.num_batches_per_rank} per rank")
 
     def set_epoch(self, epoch: int):
         """Set epoch and regenerate clips/batches."""
@@ -390,10 +417,16 @@ class FinetuneSampler(Sampler):
         self._compute_batches()
 
     def __iter__(self):
-        start = self.rank * self.num_batches_per_rank
-        end = start + self.num_batches_per_rank
-        for batch in self._all_batches[start:end]:
-            yield batch
+        total = len(self._all_batches)
+        if self.num_batches_per_rank == total:
+            # Val mode (no split): every rank iterates all batches
+            for batch in self._all_batches:
+                yield batch
+        else:
+            start = self.rank * self.num_batches_per_rank
+            end = start + self.num_batches_per_rank
+            for batch in self._all_batches[start:end]:
+                yield batch
 
     def __len__(self) -> int:
         return self.num_batches_per_rank
@@ -414,6 +447,10 @@ def finetune_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch
         result['boundary_right'] = torch.stack([item['boundary_right'] for item in batch], dim=0)
         result['boundary_bottom'] = torch.stack([item['boundary_bottom'] for item in batch], dim=0)
         result['boundary_top'] = torch.stack([item['boundary_top'] for item in batch], dim=0)
+
+    # Optional force field (time-invariant, per-sample)
+    if 'force' in batch[0]:
+        result['force'] = torch.stack([item['force'] for item in batch], dim=0)
 
     return result
 

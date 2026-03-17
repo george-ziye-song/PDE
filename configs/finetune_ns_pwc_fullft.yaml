@@ -1,0 +1,85 @@
+# NS-PwC Full Fine-Tuning (all parameters, full-field RMSE)
+# Stage 1: Adapt pretrained dec_v3 model to NS-PwC flow
+# Stage 2: Use this checkpoint as base for LoRA fine-tuning on NS-SVS
+#
+# Channels: Vx(0), Vy(1), tracer=scalar[11]=ch14
+# Periodic BCs, incompressible NS + passive tracer
+
+model_name: ns_pwc_fullft
+
+model:
+  in_channels: 18
+  hidden_dim: 768
+  patch_size: 16
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+  encoder:
+    stem_hidden: 128
+    stem_out: 256
+    use_cnn_pool: false
+
+  intra_patch:
+    num_layers: 2
+    temporal_window: 3
+    num_heads: 8
+
+  na:
+    base_kernel: 5
+
+  decoder:
+    version: 'v3'
+    stem_channels: 256
+    hidden_channels: 256
+    use_skip: true
+    cross_patch:
+      enabled: true
+      kernel_size: 3
+      num_layers: 2
+
+  vector_channels: 3
+  scalar_channels: 15
+
+  enable_1d: false
+  enable_3d: false
+  gradient_checkpointing: true
+
+training:
+  max_epochs: 30
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  warmup_steps: 50
+  min_lr: 1.0e-7
+  grad_clip: 1.0
+
+  eval_interval: 100
+  early_stopping_patience: 30
+
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+
+dataloader:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: /scratch-share/SONG0304/finetune/ns_pwc_1k.hdf5
+  seed: 42
+  t_input: 8
+  train_ratio: 0.9
+  clips_per_sample: null
+  val_time_interval: 4
+  vector_dim: 2
+
+logging:
+  project: pde-ns-pwc-fullft
+  entity: null
+  save_dir: ./checkpoints_ns_pwc_fullft
+  log_interval: 10
+
+checkpoint:
+  init_from: ./checkpoints_v4_2donly_dec_v3/best_tf.pt
+  resume_from: null

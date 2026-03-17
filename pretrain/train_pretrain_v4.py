@@ -36,7 +36,8 @@ import yaml
 import torch
 from pathlib import Path
 from torch.utils.data import DataLoader
-from accelerate import Accelerator, DistributedDataParallelKwargs
+import datetime
+from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from rich.console import Console
 from rich.progress import (
@@ -121,6 +122,9 @@ def create_accelerator(config: dict) -> tuple[Accelerator, bool]:
     grad_accum = config['training'].get('gradient_accumulation_steps', 2)
     mixed_precision = config['training'].get('mixed_precision', 'no')
 
+    # Increase NCCL timeout for large validation sets (default 600s is too short)
+    timeout_kwargs = InitProcessGroupKwargs(timeout=datetime.timedelta(minutes=30))
+
     if use_fsdp:
         from accelerate import FullyShardedDataParallelPlugin
         from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
@@ -144,19 +148,20 @@ def create_accelerator(config: dict) -> tuple[Accelerator, bool]:
             gradient_accumulation_steps=grad_accum,
             log_with="wandb",
             fsdp_plugin=fsdp_plugin,
+            kwargs_handlers=[timeout_kwargs],
         )
         if accelerator.is_main_process:
-            logger.info("Using FSDP (FullyShardedDataParallel)")
+            logger.info("Using FSDP (FullyShardedDataParallel) with 30min NCCL timeout")
     else:
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         accelerator = Accelerator(
             mixed_precision=mixed_precision,
             gradient_accumulation_steps=grad_accum,
             log_with="wandb",
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, timeout_kwargs],
         )
         if accelerator.is_main_process:
-            logger.info("Using DDP (DistributedDataParallel)")
+            logger.info("Using DDP (DistributedDataParallel) with 30min NCCL timeout")
 
     return accelerator, use_fsdp
 
@@ -219,16 +224,32 @@ def save_resume_state(
     accelerator, save_dir: Path, scheduler,
     global_step: int, best_val_rmse: float
 ):
-    """Save full training state for resume (FSDP-compatible via accelerate)."""
+    """Save full training state for resume (FSDP-compatible via accelerate).
+
+    Uses atomic write: save to temp dir first, then rename.
+    Prevents corruption if process is killed during save.
+    """
+    import shutil
     resume_dir = save_dir / "resume"
-    accelerator.save_state(str(resume_dir))
+    tmp_dir = save_dir / "resume_tmp"
+
+    # Write to temp directory
+    accelerator.save_state(str(tmp_dir))
 
     if accelerator.is_main_process:
         torch.save({
             'global_step': global_step,
             'best_val_rmse': best_val_rmse,
             'scheduler_state_dict': scheduler.state_dict(),
-        }, resume_dir / "metadata.pt")
+        }, tmp_dir / "metadata.pt")
+
+    accelerator.wait_for_everyone()
+
+    # Atomic replace: old → delete, tmp → resume
+    if accelerator.is_main_process:
+        if resume_dir.exists():
+            shutil.rmtree(resume_dir)
+        tmp_dir.rename(resume_dir)
 
     accelerator.wait_for_everyone()
 
@@ -260,6 +281,12 @@ def validate(model, val_loader, accelerator, t_input: int = 8) -> tuple[float, d
     accelerator.wait_for_everyone()
     model.eval()
 
+    # Bypass DDP wrapper during validation to avoid implicit sync hooks
+    # (DDP with find_unused_parameters=True can cause NCCL timeouts in eval)
+    # FSDP must keep wrapper (parameters are sharded)
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    eval_model = model.module if isinstance(model, DDP) else model
+
     total_rmse = torch.zeros(1, device=accelerator.device)
     num_batches = torch.zeros(1, device=accelerator.device)
 
@@ -275,7 +302,7 @@ def validate(model, val_loader, accelerator, t_input: int = 8) -> tuple[float, d
         input_data = data[:, :t_input]
         target_data = data[:, 1:t_input + 1]
 
-        output_norm, mean, std = model(input_data, return_normalized=True)
+        output_norm, mean, std = eval_model(input_data, return_normalized=True)
         target_norm = (target_data - mean) / std
 
         rmse = compute_normalized_rmse_loss(output_norm.float(), target_norm.float(), channel_mask)
@@ -384,6 +411,17 @@ def main():
     if accelerator.is_main_process:
         logger.info(f"Model parameters: {model.get_num_params():,}")
 
+    # Freeze encoder + transformer if configured (only train decoder)
+    if config['training'].get('freeze_encoder_transformer', False):
+        frozen_count = 0
+        for name, param in model.named_parameters():
+            if not name.startswith('decoder'):
+                param.requires_grad = False
+                frozen_count += param.numel()
+        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if accelerator.is_main_process:
+            logger.info(f"Froze encoder+transformer: {frozen_count:,} params frozen, {trainable_count:,} trainable (decoder only)")
+
     # torch.compile for flex_attention fusion in transformer (BEFORE accelerator.prepare)
     # Only compile transformer layers (not CNN encoder/decoder to avoid conv backward stride issues)
     if config['training'].get('use_compile', False):
@@ -392,9 +430,10 @@ def main():
         if accelerator.is_main_process:
             logger.info("Applied torch.compile to transformer layers (first few steps will be slow)")
 
-    # Create optimizer
+    # Create optimizer (only trainable params)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=config['training']['learning_rate'],
         weight_decay=config['training']['weight_decay'],
         betas=tuple(config['training'].get('betas', [0.9, 0.95]))
@@ -412,8 +451,45 @@ def main():
         global_step, best_val_rmse = load_resume_state(
             accelerator, resume_from, scheduler
         )
-        # Advance scheduler to match global_step
-        # (scheduler state is loaded from metadata)
+
+    # Baseline validation: when init_from is used, measure init weights' val_rmse
+    # so that best model is only saved when it improves over the baseline
+    if init_from and not resume_from:
+        decoder_version = config.get('model', {}).get('decoder', {}).get('version', 'v2')
+        # Detect checkpoint type: V2 has 'decoder.cnn_decoder.decoder.*', V3 has 'decoder.cnn_decoder.stage*'
+        ckpt_tmp = torch.load(init_from, map_location='cpu', weights_only=False)
+        ckpt_sd = ckpt_tmp.get('model_state_dict', ckpt_tmp.get('state_dict', ckpt_tmp))
+        ckpt_is_v2 = any(k.startswith('decoder.cnn_decoder.decoder.') for k in ckpt_sd)
+        del ckpt_tmp, ckpt_sd
+
+        if decoder_version == 'v3' and ckpt_is_v2:
+            # V3 model + V2 checkpoint: CNN keys mismatch.
+            # Create a temporary V2 model to get the true baseline.
+            if accelerator.is_main_process:
+                logger.info("Decoder V3 + V2 checkpoint — building temporary V2 model for baseline")
+            import copy
+            config_v2 = copy.deepcopy(config)
+            config_v2['model']['decoder'] = {
+                'stem_channels': config['model'].get('decoder', {}).get('stem_channels', 256),
+                'hidden_channels': 128,
+            }
+            baseline_model = PDEModelV3(config_v2)
+            load_init_weights(baseline_model, init_from, accelerator)
+            baseline_model = accelerator.prepare(baseline_model)
+            baseline_rmse, baseline_per_ds = validate(baseline_model, val_loader, accelerator, t_input)
+            del baseline_model
+            torch.cuda.empty_cache()
+        else:
+            # V2→V2, V3→V3, or V2+post_smooth: weights load directly
+            baseline_rmse, baseline_per_ds = validate(model, val_loader, accelerator, t_input)
+
+        best_val_rmse = baseline_rmse
+        if accelerator.is_main_process:
+            ds_str = ", ".join([f"{k}={v:.4f}" for k, v in baseline_per_ds.items()])
+            ckpt_type = "V2" if ckpt_is_v2 else "V3"
+            logger.info(f"Baseline val_rmse (init_from {ckpt_type} ckpt): {baseline_rmse:.6f}")
+            logger.info(f"  Per-dataset: {ds_str}")
+            logger.info(f"  best_val_rmse initialized to {best_val_rmse:.6f} — only save when improved")
 
     if accelerator.is_main_process:
         run_name = f"v4-{'fsdp' if use_fsdp else 'ddp'}-{model_name}-h{hidden_dim}-L{num_layers}"
@@ -433,6 +509,7 @@ def main():
         save_dir.mkdir(parents=True, exist_ok=True)
 
     patience_counter = 0
+    saved_best = False
     console = Console()
     early_stop = False
 
@@ -555,6 +632,7 @@ def main():
                                 global_step, best_val_rmse
                             )
 
+                            saved_best = True
                             if accelerator.is_main_process:
                                 console.print(f"[yellow]Saved best model[/yellow] (val_rmse: {val_rmse:.6f})")
                         else:
@@ -572,6 +650,16 @@ def main():
                             console.print(f"[dim](warmup phase - no model saving)[/dim]")
 
                     model.train()
+
+    # Frozen mode fallback: if never beat baseline, save last model
+    is_frozen = config['training'].get('freeze_encoder_transformer', False)
+    if is_frozen and not saved_best:
+        if accelerator.is_main_process:
+            console.print("[yellow]Frozen mode: never beat baseline — saving last model[/yellow]")
+        save_portable_checkpoint(
+            model, global_step, val_rmse, best_val_rmse,
+            config, save_dir, accelerator, 'last_tf.pt'
+        )
 
     accelerator.end_training()
 

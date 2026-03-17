@@ -68,6 +68,10 @@ training:
   lambda_bc: 1.0   # Boundary loss weight
   lambda_pde: 0.01 # PDE loss weight
 
+  # Save criterion: save_rmse_weight * val_rmse + save_pde_weight * val_pde
+  save_rmse_weight: 100
+  save_pde_weight: 1
+
   # Eval interval (steps)
   eval_interval: 90
 

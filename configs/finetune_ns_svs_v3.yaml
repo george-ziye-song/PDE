@@ -1,0 +1,131 @@
+# NS-SVS (POSEIDON) LoRA Finetuning Configuration (V3 Model)
+# Incompressible NS + Tracer, periodic BC, AZEBAN spectral solver
+# Loss: BC (boundary supervised) + PDE (divergence + vorticity + tracer)
+# Channels: Vx(0), Vy(1), tracer(14) = scalar[11]
+# No force, no pressure
+# IC: Sinusoidal vortex sheet (vs NS-PwC's piecewise constant)
+
+model_name: ns_svs_lora_v3
+
+model:
+  # Must match pretrained V3s model architecture
+  in_channels: 18
+  hidden_dim: 768
+  patch_size: 16
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+  encoder:
+    stem_hidden: 128
+    stem_out: 256
+    use_cnn_pool: false
+
+  intra_patch:
+    num_layers: 2
+    temporal_window: 3
+    num_heads: 8
+
+  na:
+    base_kernel: 5
+
+  decoder:
+    version: 'v3'
+    stem_channels: 256
+    hidden_channels: 256
+    use_skip: true
+    cross_patch:
+      enabled: true
+      kernel_size: 3
+      num_layers: 2
+
+  vector_channels: 3
+  scalar_channels: 15
+
+  enable_1d: false
+  enable_3d: false
+
+  pretrained_path: ./checkpoints_ns_pwc_fullft/best_tf.pt
+  gradient_checkpointing: true
+
+  freeze_encoder: false
+  freeze_decoder: false
+
+  # LoRA configuration
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - qkv
+      - proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+training:
+  max_epochs: 30
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  warmup_steps: 200
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+  # Loss weights: BC (supervised) + PDE (physics), NO RMSE
+  lambda_bc: 10000.0     # Boundary RMSE (supervised anchor, 4 edges)
+  lambda_pde: 1.0        # PDE residual loss (per-equation normalized)
+
+  # Save criterion: save_vrmse_weight * val_vrmse + save_pde_weight * val_pde
+  save_vrmse_weight: 100
+  save_pde_weight: 1
+
+  eval_interval: 200
+  early_stopping_patience: 30
+
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+
+dataloader:
+  batch_size: 20           # 128x128 is 16x smaller than 512x512
+  num_workers: 4
+  pin_memory: true
+
+dataset:
+  path: /scratch-share/SONG0304/finetune/ns_svs_1k.hdf5
+  seed: 42
+  t_input: 8
+  train_ratio: 0.9        # 2,354 samples -> 2,118 train, 236 val
+  clips_per_sample: 10    # 21 frames, temporal_length=9 -> max 12 clips
+  val_time_interval: 1
+  vector_dim: 2
+
+logging:
+  project: pde-ns-svs-lora
+  entity: null
+  save_dir: ./checkpoints_ns_svs_lora_v3
+  log_interval: 10
+
+checkpoint:
+  resume_from: null
+
+physics:
+  nx: 128
+  ny: 128
+  Lx: 1.0
+  Ly: 1.0
+  dt: 0.05
+  nu: 4.0e-4       # AZEBAN spectral solver: nu ~ 4e-4
+  kappa: 4.0e-4     # Tracer diffusivity kappa ~ nu
+
+  # Per-equation normalization scales (GT RMS from test_gt_pde_ns_svs.py, 100 samples)
+  eq_scales:
+    divergence: 7.57e-3
+    vorticity: 12.69
+    tracer: 1.54
+
+  # Per-equation weights (default 1.0 for all)
+  eq_weights:
+    divergence: 1.0
+    vorticity: 1.0
+    tracer: 10.0  
