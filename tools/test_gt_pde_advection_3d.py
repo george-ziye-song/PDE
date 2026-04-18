@@ -6,13 +6,13 @@ for normalized PDE loss.
 Advection equation:
     u_t + a*u_x + b*u_y + c*u_z = 0
 
-Numerical method:
-    - Spatial: 4th-order central difference (periodic BC via np.roll)
-    - Temporal: 2nd-order central difference
+Two schemes:
+  (A) 4th-order central u_x/u_y/u_z  [matches Advection3DPDELoss in training]
+  (B) n-PINN 2nd-order upwind: a*(Fe-Fw)/dx per direction, sign-based face reconstruction
 
 Usage:
     python tools/test_gt_pde_advection_3d.py \
-        --data /home/msai/song0304/code/PDE/data/finetune/advection_3d.hdf5
+        --data /scratch-share/SONG0304/finetune/advection_3d.hdf5
 """
 
 import argparse
@@ -23,158 +23,156 @@ import numpy as np
 import torch
 
 
-def fd_dx_4th_periodic(f: np.ndarray, dx: float) -> np.ndarray:
-    """4th-order central first derivative in x (axis=-3), periodic BC."""
+# ── 4th-order central ──────────────────────────────────────────────────────────
+
+def fd_4th(f: np.ndarray, axis: int, dx: float) -> np.ndarray:
+    """4th-order central first derivative along given axis, periodic BC."""
     return (
-        -np.roll(f, -2, axis=-3) + 8 * np.roll(f, -1, axis=-3)
-        - 8 * np.roll(f, 1, axis=-3) + np.roll(f, 2, axis=-3)
+        -np.roll(f, -2, axis=axis) + 8 * np.roll(f, -1, axis=axis)
+        - 8 * np.roll(f,  1, axis=axis) + np.roll(f,  2, axis=axis)
     ) / (12 * dx)
 
 
-def fd_dy_4th_periodic(f: np.ndarray, dy: float) -> np.ndarray:
-    """4th-order central first derivative in y (axis=-2), periodic BC."""
-    return (
-        -np.roll(f, -2, axis=-2) + 8 * np.roll(f, -1, axis=-2)
-        - 8 * np.roll(f, 1, axis=-2) + np.roll(f, 2, axis=-2)
-    ) / (12 * dy)
+def compute_residual_central(
+    u: np.ndarray, dx: float, dy: float, dz: float, dt: float,
+    a: float, b: float, c: float,
+) -> np.ndarray:
+    """Residual using 4th-order central spatial, 2nd-order central temporal."""
+    du_dt = (u[2:] - u[:-2]) / (2 * dt)          # [T-2, X, Y, Z]
+    u_n   = u[1:-1]                                # [T-2, X, Y, Z]
+    R = du_dt + a * fd_4th(u_n, -3, dx) \
+              + b * fd_4th(u_n, -2, dy) \
+              + c * fd_4th(u_n, -1, dz)
+    return R
 
 
-def fd_dz_4th_periodic(f: np.ndarray, dz: float) -> np.ndarray:
-    """4th-order central first derivative in z (axis=-1), periodic BC."""
-    return (
-        -np.roll(f, -2, axis=-1) + 8 * np.roll(f, -1, axis=-1)
-        - 8 * np.roll(f, 1, axis=-1) + np.roll(f, 2, axis=-1)
-    ) / (12 * dz)
+# ── n-PINN 2nd-order upwind ───────────────────────────────────────────────────
 
+def adv_upwind_2nd_1d(f: np.ndarray, v: float, dx: float, axis: int) -> np.ndarray:
+    """n-PINN 2nd-order upwind advection term v*(Fe-Fw)/dx along one axis.
 
-def compute_residuals(
-    u: np.ndarray,
-    dx: float,
-    dy: float,
-    dz: float,
-    dt: float,
-    a: float,
-    b: float,
-    c: float,
-) -> dict:
-    """Compute 3D advection PDE residual.
-
-    Args:
-        u: shape [T, X, Y, Z]
-        dx, dy, dz, dt: grid spacings
-        a, b, c: advection velocity components
-
-    Returns:
-        dict with 'advection' residual array, shape [T-2, X, Y, Z]
+    Face reconstruction (same as Advection1DPDELoss._adv_upwind_2nd):
+        v >= 0: Fe = 1.5*f - 0.5*f_{i-1},  Fw = 1.5*f_{i-1} - 0.5*f_{i-2}
+        v <  0: Fe = 1.5*f_{i+1} - 0.5*f_{i+2}, Fw = 1.5*f - 0.5*f_{i+1}
     """
-    # 2nd-order central time derivative
+    f_ip1 = np.roll(f, -1, axis=axis)
+    f_im1 = np.roll(f,  1, axis=axis)
+    f_ip2 = np.roll(f, -2, axis=axis)
+    f_im2 = np.roll(f,  2, axis=axis)
+    if v >= 0:
+        Fe = 1.5 * f    - 0.5 * f_im1
+        Fw = 1.5 * f_im1 - 0.5 * f_im2
+    else:
+        Fe = 1.5 * f_ip1 - 0.5 * f_ip2
+        Fw = 1.5 * f    - 0.5 * f_ip1
+    return v * (Fe - Fw) / dx
+
+
+def compute_residual_upwind(
+    u: np.ndarray, dx: float, dy: float, dz: float, dt: float,
+    a: float, b: float, c: float,
+) -> np.ndarray:
+    """Residual using n-PINN 2nd-order upwind spatial, 2nd-order central temporal."""
     du_dt = (u[2:] - u[:-2]) / (2 * dt)
+    u_n   = u[1:-1]
+    R = du_dt \
+        + adv_upwind_2nd_1d(u_n, a, dx, axis=-3) \
+        + adv_upwind_2nd_1d(u_n, b, dy, axis=-2) \
+        + adv_upwind_2nd_1d(u_n, c, dz, axis=-1)
+    return R
 
-    # Spatial terms at mid-frame
-    u_n = u[1:-1]
 
-    du_dx = fd_dx_4th_periodic(u_n, dx)
-    du_dy = fd_dy_4th_periodic(u_n, dy)
-    du_dz = fd_dz_4th_periodic(u_n, dz)
-
-    # Residual: u_t + a*u_x + b*u_y + c*u_z = 0
-    R = du_dt + a * du_dx + b * du_dy + c * du_dz
-
-    return {'advection': R}
-
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="GT PDE residual for 3D Advection")
     parser.add_argument(
         "--data", type=str,
-        default="/home/msai/song0304/code/PDE/data/finetune/advection_3d.hdf5",
-        help="Path to HDF5 file",
+        default="/scratch-share/SONG0304/finetune/advection_3d.hdf5",
     )
     parser.add_argument("--max_samples", type=int, default=100)
     args = parser.parse_args()
 
     L = 2 * np.pi
     N_GRID = 64
-    dx = L / N_GRID
-    dy = dx
-    dz = dx
+    dx = dy = dz = L / N_GRID
     dt = 0.05
 
     print(f"Loading: {args.data}")
     with h5py.File(args.data, 'r') as f:
-        scalar = f['scalar']
-        a_vals = f['params_a'][:]
-        b_vals = f['params_b'][:]
-        c_vals = f['params_c'][:]
-        n_samples_total = scalar.shape[0]
-        n_time = scalar.shape[1]
-        print(f"  Samples={n_samples_total}, T={n_time}, "
-              f"Grid={scalar.shape[2]}x{scalar.shape[3]}x{scalar.shape[4]}, "
-              f"Scalar_ch={scalar.shape[5]}")
-        print(f"  dx={dx:.6f}, dy={dy:.6f}, dz={dz:.6f}, dt={dt}")
+        scalar  = f['scalar']
+        a_vals  = f['params_a'][:]
+        b_vals  = f['params_b'][:]
+        c_vals  = f['params_c'][:]
+        n_total = scalar.shape[0]
+        n_time  = scalar.shape[1]
+        print(f"  Samples={n_total}, T={n_time}, "
+              f"Grid={scalar.shape[2]}^3, dx={dx:.6f}, dt={dt}")
+        print(f"  a range: [{a_vals.min():.4f}, {a_vals.max():.4f}]")
+        print(f"  b range: [{b_vals.min():.4f}, {b_vals.max():.4f}]")
+        print(f"  c range: [{c_vals.min():.4f}, {c_vals.max():.4f}]")
 
-        n_proc = min(n_samples_total, args.max_samples)
+        n_proc = min(n_total, args.max_samples)
+        rms_central  = []
+        rms_upwind   = []
+        per_t_central = None
+        per_t_upwind  = None
 
-        eq_names = ['advection']
-        all_rms = {k: [] for k in eq_names}
-        all_rms_per_t = {k: [] for k in eq_names}
+        print(f"\nComputing residuals for {n_proc} samples...")
+        print(f"  (A) 4th-order central  [matches training loss]")
+        print(f"  (B) n-PINN 2nd-order upwind")
 
-        for s_idx in range(n_proc):
-            scl = np.array(scalar[s_idx], dtype=np.float64)  # [T, X, Y, Z, 1]
-            u = scl[:, :, :, :, 0]  # [T, X, Y, Z]
-            a_i = float(a_vals[s_idx])
-            b_i = float(b_vals[s_idx])
-            c_i = float(c_vals[s_idx])
+        for s in range(n_proc):
+            u = np.array(scalar[s, :, :, :, :, 0], dtype=np.float64)  # [T,X,Y,Z]
+            a_i, b_i, c_i = float(a_vals[s]), float(b_vals[s]), float(c_vals[s])
 
-            res = compute_residuals(u, dx, dy, dz, dt, a_i, b_i, c_i)
+            R_c = compute_residual_central(u, dx, dy, dz, dt, a_i, b_i, c_i)
+            R_u = compute_residual_upwind (u, dx, dy, dz, dt, a_i, b_i, c_i)
 
-            for eq in eq_names:
-                rms = np.sqrt(np.mean(res[eq] ** 2))
-                all_rms[eq].append(rms)
+            rms_c = float(np.sqrt(np.mean(R_c**2)))
+            rms_u = float(np.sqrt(np.mean(R_u**2)))
+            rms_central.append(rms_c)
+            rms_upwind .append(rms_u)
 
-                # Per-timestep RMS for eq_scales_per_t
-                rms_per_t = np.sqrt(np.mean(res[eq] ** 2, axis=(1, 2, 3)))  # [T-2]
-                all_rms_per_t[eq].append(rms_per_t)
+            pt_c = np.sqrt(np.mean(R_c**2, axis=(1, 2, 3)))  # [T-2]
+            pt_u = np.sqrt(np.mean(R_u**2, axis=(1, 2, 3)))
+            per_t_central = pt_c if per_t_central is None else per_t_central + pt_c
+            per_t_upwind  = pt_u if per_t_upwind  is None else per_t_upwind  + pt_u
 
-            if s_idx < 3 or s_idx == n_proc - 1:
-                v_mag = np.sqrt(a_i**2 + b_i**2 + c_i**2)
-                print(f"  Sample {s_idx} (|v|={v_mag:.4f}, a={a_i:.4f}, b={b_i:.4f}, c={c_i:.4f}): "
-                      f"advection={all_rms['advection'][-1]:.4e}")
+            if s < 3 or s == n_proc - 1:
+                print(f"  [{s:3d}] a={a_i:.3f} b={b_i:.3f} c={c_i:.3f} | "
+                      f"central={rms_c:.4e}  upwind={rms_u:.4e}")
 
-    # Summary
+    per_t_central /= n_proc
+    per_t_upwind  /= n_proc
+
+    arr_c = np.array(rms_central)
+    arr_u = np.array(rms_upwind)
+
     print(f"\n{'='*70}")
-    print(f"Summary over {n_proc} samples")
+    print(f"Summary ({n_proc} samples)")
     print(f"{'='*70}")
+    print(f"  (A) 4th-order central:       mean={arr_c.mean():.6e}  std={arr_c.std():.4e}  max={arr_c.max():.4e}")
+    print(f"  (B) n-PINN 2nd-order upwind: mean={arr_u.mean():.6e}  std={arr_u.std():.4e}  max={arr_u.max():.4e}")
 
-    print(f"\n{'Equation':<15} | {'Mean RMS':>12} | {'Std RMS':>12} | {'Min RMS':>12} | {'Max RMS':>12}")
-    print("-" * 70)
-    for eq in eq_names:
-        arr = np.array(all_rms[eq])
-        print(f"{eq:<15} | {arr.mean():>12.4e} | {arr.std():>12.4e} | "
-              f"{arr.min():>12.4e} | {arr.max():>12.4e}")
+    print(f"\n  >>> Using 4th-order central as eq_scales (matches Advection3DPDELoss)")
+    print(f"\n  --- eq_scales for config ---")
+    print(f"  physics:")
+    print(f"    eq_scales:")
+    print(f"      advection: {arr_c.mean():.4e}")
 
-    # eq_scales for config
-    print(f"\n--- eq_scales for config (Mean RMS values) ---")
-    print("physics:")
-    print("  eq_scales:")
-    for eq in eq_names:
-        arr = np.array(all_rms[eq])
-        print(f"    {eq}: {arr.mean():.4e}")
-
-    # Save per-timestep scales
     gt_scales_dir = './data/gt_scales'
     os.makedirs(gt_scales_dir, exist_ok=True)
-    per_t_dict = {}
-    for eq in eq_names:
-        per_t_arr = np.array(all_rms_per_t[eq])  # [N, T-2]
-        mean_per_t = np.mean(per_t_arr, axis=0)  # [T-2]
-        per_t_dict[eq] = torch.tensor(mean_per_t, dtype=torch.float32)
-        print(f"\n  {eq} per-t RMS: shape={mean_per_t.shape}, "
-              f"min={mean_per_t.min():.4e}, max={mean_per_t.max():.4e}")
-
     save_path = os.path.join(gt_scales_dir, 'advection_3d_per_t.pt')
-    torch.save(per_t_dict, save_path)
-    print(f"\nSaved per-timestep scales to: {save_path}")
+    torch.save({
+        'advection':          torch.tensor(per_t_central, dtype=torch.float32),
+        'scheme':             'central_4th',
+        'mean_rms_central':   float(arr_c.mean()),
+        'mean_rms_upwind2':   float(arr_u.mean()),
+    }, save_path)
+    print(f"\n  Saved per-timestep scales → {save_path}")
+    print(f"    advection (central): shape={per_t_central.shape}, mean={per_t_central.mean():.6e}")
+    print(f"{'='*70}")
 
 
 if __name__ == "__main__":

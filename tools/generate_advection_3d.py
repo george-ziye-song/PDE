@@ -5,11 +5,9 @@ PDE: u_t + a*u_x + b*u_y + c*u_z = 0
 Exact solution (multi-mode Fourier, periodic):
     u(x,y,z,t) = sum_{l,m,n} A_lmn * cos(l*(x-a*t) + m*(y-b*t) + n*(z-c*t) + phi_lmn)
 
-The initial condition is simply translated by the velocity vector (a,b,c).
-
 Domain: [0, 2*pi]^3, periodic BC
 Resolution: 64x64x64, dt=0.05, T=21 steps (t=0 to 1.0)
-Parameters: (a,b,c) random direction on unit sphere, |v| in [0.5, 2.0]
+Parameters: (a,b,c) ~ Uniform([0.5, 2.0]^3) independently per component (all positive)
 Channels: scalar=[u], scalar_indices=[11] (ch14, matches CH_U=14 in train script)
 vector: all zeros [N, T, X, Y, Z, 3] (required 6D for 3D detection)
 """
@@ -89,16 +87,12 @@ def generate_dataset():
     # Random parameters
     rng = np.random.RandomState(42)
 
-    # Per-sample velocity: random direction on unit sphere, random magnitude
-    v_magnitudes = rng.uniform(V_MIN, V_MAX, N_SAMPLES).astype(np.float32)
-    # Random direction via Gaussian normalized
-    raw_dirs = rng.randn(N_SAMPLES, 3)
-    norms = np.linalg.norm(raw_dirs, axis=1, keepdims=True)
-    unit_dirs = raw_dirs / norms  # [N, 3]
-
-    a_vals = (unit_dirs[:, 0] * v_magnitudes).astype(np.float32)
-    b_vals = (unit_dirs[:, 1] * v_magnitudes).astype(np.float32)
-    c_vals = (unit_dirs[:, 2] * v_magnitudes).astype(np.float32)
+    # Per-sample velocity: each component independently ~ Uniform([0.5, 2.0])
+    # Matches spec: (a,b,c) ~ Uniform([0.5, 2.0]^3), all positive
+    a_vals = rng.uniform(V_MIN, V_MAX, N_SAMPLES).astype(np.float32)
+    b_vals = rng.uniform(V_MIN, V_MAX, N_SAMPLES).astype(np.float32)
+    c_vals = rng.uniform(V_MIN, V_MAX, N_SAMPLES).astype(np.float32)
+    v_magnitudes = np.sqrt(a_vals**2 + b_vals**2 + c_vals**2).astype(np.float32)
 
     # For each sample: randomly select 8-15 modes
     N_MODES_MIN = 8

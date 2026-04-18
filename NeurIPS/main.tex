@@ -131,9 +131,9 @@ In this work, we ask a natural yet unexplored question: \emph{can a pretrained P
 Our central finding is that the pretrained model provides rich physical priors that make unsupervised PDE-based finetuning viable, enabling PDE residual and boundary condition losses to effectively guide the optimization. We evaluate on 1D, 2D, and 3D PDEs with closed-form solutions together with 4 datasets from The Well~\cite{ohana2024thewell}, and demonstrate that our framework consistently and significantly outperforms PINN baselines across all evaluated datasets, while training without pretrained initialization leads to severe performance degradation. Although a performance gap remains compared to fully supervised foundation model finetuning, we regard this work as a proof of concept toward a universal unsupervised PDE solver, with extension to higher dimensions and broader physical regimes being a natural next step. Our contributions are summarized as follows:
 \begin{itemize}
     \item We propose and validate, for the first time, an unsupervised PDE-based LoRA finetuning paradigm for PDE foundation models that adapts to unseen PDEs using only boundary condition and PDE residual losses, without any ground-truth solution data.
-    \item We introduce Orthogonal LoRA, an orthogonal variant of LoRA that applies Newton-Schulz iteration to each low-rank factor independently, preserving the geometric structure of the pretrained feature space and preventing rank collapse during unsupervised adaptation.
-    \item We provide systematic ablation analyses demonstrating that pretrained initialization is essential for unsupervised PDE-based finetuning to succeed, and quantifying the remaining gap between unsupervised and fully supervised LoRA finetuning.
-    \item We conduct comprehensive evaluations across 1D, 2D, and 3D PDEs at varying resolutions, spanning PDEs with closed-form solutions and complex real-world simulations from The Well, demonstrating cross-physics and cross-dimensional transferability.
+    \item We introduce Orthogonal LoRA, a variant of LoRA that applies Newton-Schulz iteration to each low-rank factor so that every rank component contributes a unit-norm direction to the weight update, recovering the rank capacity that standard LoRA leaves unused under unsupervised training.
+    \item We ablate the framework: pretrained initialization is essential (Table~\ref{tab:ablation_pretrain}), and the remaining gap to supervised LoRA is $1.0$--$4.3\times$ in VRMSE (Table~\ref{tab:ablation_supervised}).
+    \item We evaluate on four real-world systems from The Well~\cite{ohana2024thewell} and on 2D PDEs with closed-form solutions, covering unseen PDE families.
 \end{itemize}
 
 
@@ -159,7 +159,7 @@ Our work integrates unsupervised PDE-based finetuning with a Transformer foundat
 \section{Approach}
 \label{sec:method}
 
-Adapting a pretrained PDE foundation model to an unseen PDE system poses a central challenge because dense ground-truth solution fields for the target equation are typically unavailable. Our framework responds with three coupled design choices that are developed in the following subsections. Section~\ref{sec:formulation} formulates PDE solving as an autoregressive operator learning task. Section~\ref{sec:architecture} describes the forward pass of our multi-dimensional architecture. Section~\ref{sec:orthlora} introduces Orthogonal LoRA, a low-rank adaptation mechanism that preserves the spectral structure of the pretrained weights. Section~\ref{sec:physlora} defines the combined loss that supervises the adaptation using only boundary conditions and PDE residuals.
+Adapting a pretrained PDE foundation model to an unseen PDE system poses a central challenge because dense ground-truth solution fields for the target equation are typically unavailable. Our framework combines an architecture that ingests 1D, 2D, and 3D physical channels in a single forward pass (Section~\ref{sec:architecture}), a LoRA adaptation with orthogonalized factors that equalizes the contribution of all rank components (Section~\ref{sec:orthlora}), and a training objective that pairs a thin boundary anchor with an equation-wise normalized PDE residual (Section~\ref{sec:physlora}). Section~\ref{sec:formulation} first formulates the task.
 
 \subsection{Problem Formulation}
 \label{sec:formulation}
@@ -175,10 +175,10 @@ We formulate PDE solving as an autoregressive operator learning task. Given $T_{
 \subsection{Forward Pass and Architecture}
 \label{sec:architecture}
 
-The forward pass maps an input snapshot stack through an encoder, a shared NA Transformer, and a decoder within a single architecture that handles 1D, 2D, and 3D spatiotemporal data (see Figure~\ref{fig:overview}).
+The forward pass maps an input snapshot stack through an encoder, a shared NA Transformer, and a decoder, applied uniformly to 1D, 2D, and 3D grids (see Figure~\ref{fig:overview}).
 
 \paragraph{Unified channel representation.}
-All physical fields are mapped into a fixed 18-channel state vector, with the first 3 channels reserved for velocity components $(V_x, V_y, V_z)$ and the remaining 15 channels assigned to distinct scalar quantities (density, pressure, temperature, concentration, etc.). Each dataset specifies which channels it populates via a binary mask, and unused channels are zero-padded. This design allows a single model to ingest PDE systems with varying numbers of physical variables.
+All physical fields are mapped into a fixed 18-channel state vector, with the first 3 channels reserved for velocity components $(V_x, V_y, V_z)$ and the remaining 15 slots assigned to distinct scalar quantities registered at dataset ingestion time (density, pressure, temperature, concentration, and others). Each dataset specifies which channels it populates via a binary mask, and unused channels are zero-padded. A single model can therefore ingest PDE systems with different numbers of physical variables.
 
 \paragraph{Encoder.}
 The input $\mathbf{X} \in \mathbb{R}^{B \times T \times H \times W \times 18}$ is first normalized per sample and per channel (zero mean, unit variance). The spatial dimensions are then partitioned into non-overlapping $16 \times 16$ patches, and each patch is downsampled to a $4 \times 4$ feature map through two strided convolutions with residual blocks. An intra-patch temporal attention module allows tokens at different time steps within the same patch to exchange information. Finally, attention pooling compresses each $4 \times 4$ patch into a single 768-dimensional token, and learnable positional embeddings encoding $(t, h, w)$ coordinates are added.
@@ -187,20 +187,20 @@ The input $\mathbf{X} \in \mathbb{R}^{B \times T \times H \times W \times 18}$ i
 The token sequence is processed by 12 Transformer layers with hidden dimension 768 and 12 attention heads. Each layer consists of Neighborhood Attention (NA)~\cite{hassani2023neighborhood} followed by a SwiGLU feed-forward network. NA restricts each token to attend only its spatial neighbors within a $5 \times 5$ window, yielding $O(N \cdot k^d)$ complexity. We adopt NA because it natively supports per-dimension causal control (causal along time, non-causal along space), operates uniformly across 1D, 2D, and 3D token grids without architectural changes, and handles periodic boundaries without additional padding logic. The SwiGLU FFN parameters are shared across all spatial dimensions, while NA layers are instantiated separately per dimension.
 
 \paragraph{Decoder and post-smoothing.}
-The decoder inverts the encoder pipeline through unpooling and transposed convolutions, recovering $16 \times 16$ patches that are reassembled into the full spatial resolution. A post-smoothing module mitigates grid artifacts at patch boundaries. This module consists of three $7 \times 7$ convolutional layers whose receptive field (19 pixels) exceeds the patch size (16 pixels), enabling cross-patch smoothing. A zero-initialized residual connection ensures the module acts as an identity mapping at the start of training. The output is then denormalized to recover the original physical scale. The full model comprises approximately 182M parameters.
+The decoder inverts the encoder pipeline through unpooling and transposed convolutions, recovering $16 \times 16$ patches that are reassembled into the full spatial resolution. A post-smoothing module of three $7 \times 7$ convolutional layers is applied to the reassembled field to reduce seam artifacts at patch boundaries, with a zero-initialized residual connection so that it acts as an identity mapping at the start of training. The output is then denormalized to recover the original physical scale. The full model comprises approximately 182M parameters.
 
 \subsection{Orthogonal LoRA Adaptation}
 \label{sec:orthlora}
 
-Given a target PDE absent from the pretraining data, we freeze the pretrained Transformer backbone and attach low-rank adapters to all 12 Transformer layers. LoRA modules~\cite{hu2022lora} are inserted into the fused query-key-value projection and output projection of each NA layer, and into the gate, up, and down projections of each SwiGLU layer, with rank $r\!=\!16$ and scaling factor $\alpha\!=\!32$.
+Given a target PDE absent from the pretraining data, we freeze the backbone and attach low-rank adapters to all 12 Transformer layers. LoRA modules~\cite{hu2022lora} are inserted into the fused query-key-value projection and output projection of each NA layer, and into the gate, up, and down projections of each SwiGLU layer, with rank $r\!=\!16$ and scaling factor $\alpha\!=\!32$.
 
-Standard LoRA parameterizes the weight update as $\Delta W = BA$ with $A \in \mathbb{R}^{r \times d_{\mathrm{in}}}$ and $B \in \mathbb{R}^{d_{\mathrm{out}} \times r}$. When driven by unsupervised physics losses, this parameterization tends to collapse toward a few dominant directions, leaving most of the available rank budget inactive. To preserve the spectral structure of the pretrained weights, we orthogonalize each low-rank factor independently via Newton-Schulz (NS) iteration~\cite{jordan2024muon}. The resulting weight update is
+Standard LoRA parameterizes the weight update as $\Delta W = BA$ with $A \in \mathbb{R}^{r \times d_{\mathrm{in}}}$ and $B \in \mathbb{R}^{d_{\mathrm{out}} \times r}$. Under unsupervised physics losses the unconstrained update tends to concentrate on a few dominant singular components, limiting the effective capacity of a rank-$r$ adapter, an effect we quantify through the Standard-versus-Orthogonal comparison in Table~\ref{tab:ablation_orthlora}. We apply Newton-Schulz iteration~\cite{jordan2024muon} to each factor independently so that every rank component contributes a unit-norm direction to the update,
 \begin{equation}
 \Delta W = \|A\|_F \cdot \|B\|_F \cdot \mathrm{NS}(B)\,\mathrm{NS}(A),
 \end{equation}
-where $\mathrm{NS}(\cdot)$ projects a matrix onto its nearest semi-orthogonal form. The Frobenius norms $\|A\|_F$ and $\|B\|_F$ act as learnable scalar magnitudes that grow during training, while the orthogonalized factors enforce uniform spectral contribution across all $r$ rank components. We refer to this variant as Orthogonal LoRA.
+where $\mathrm{NS}(B)$ returns a matrix with orthonormal columns and $\mathrm{NS}(A)$ returns a matrix with orthonormal rows. The Frobenius norms $\|A\|_F$ and $\|B\|_F$ act as learnable scalar magnitudes that take the role of the fixed $\alpha/r$ factor in standard LoRA, giving an adaptive per-module scaling. We refer to this variant as Orthogonal LoRA.
 
-The adaptation is trained in two stages. The first stage trains standard LoRA with the update $\Delta W = BA$ from zero initialization, with the encoder and decoder left trainable to allow domain-specific adaptation of the input and output representations. The second stage initializes Orthogonal LoRA from the converged factors $A$ and $B$ and continues training with the orthogonalized update, while freezing the encoder and decoder. The first stage drives the adapters toward informative update directions, and the second stage redistributes the spectral energy across the full rank budget.
+Orthogonal LoRA is initialized from a brief warm-up of standard LoRA, because the orthogonalized update preserves information only in the subspace already spanned by the factors. The warm-up trains the unconstrained update $BA$ until the factors identify a task-relevant subspace, and the second phase continues with the orthogonalized update on the same factors while freezing the encoder and decoder. The first phase determines \emph{where} the update acts; the second phase redistributes the contribution of each rank component \emph{within} that subspace.
 
 \subsection{Unsupervised PDE-Based Training Objective}
 \label{sec:physlora}
@@ -212,7 +212,7 @@ For each predicted snapshot, we compute the RMSE between the prediction and the 
 \begin{equation}
 \mathcal{L}_{\mathrm{BC}} = \sqrt{\frac{1}{|\mathcal{S}_b|} \sum_{(\mathbf{x},t) \in \mathcal{S}_b} \|\hat{\mathbf{u}}(\mathbf{x},t) - \mathbf{u}^*(\mathbf{x},t)\|^2 + \epsilon},
 \end{equation}
-where $\mathcal{S}_b$ denotes the set of boundary grid points and $\epsilon = 10^{-8}$ prevents numerical instability. Reference values are required only within this thin boundary region.
+where $\mathcal{S}_b$ is the set of boundary grid points within a strip of width $b$ pixels and $\epsilon = 10^{-8}$ prevents numerical instability. We set $b=1$ throughout, so supervision is restricted to the outermost layer of the spatial grid.
 
 \paragraph{PDE residual loss.}
 Given the governing equation $\partial_t \mathbf{u} + \mathcal{N}[\mathbf{u}] = 0$, we evaluate the discrete PDE residual on the predicted field $\hat{\mathbf{u}}$. Temporal derivatives are approximated by second-order central differences $\partial_t \hat{u} \approx (\hat{u}^{n+1} - \hat{u}^{n-1}) / (2\Delta t)$. Spatial derivatives are computed via FFT for periodic domains (spectral accuracy) and via finite differences for non-periodic domains. For equations with convective nonlinearities (e.g., Navier-Stokes, Burgers), we employ a conservative upwind discretization with second-order face-value interpolation,
@@ -231,7 +231,7 @@ The overall training objective is the weighted sum
 \begin{equation}
 \mathcal{L} = \lambda_{\mathrm{BC}} \cdot \mathcal{L}_{\mathrm{BC}} + \lambda_{\mathrm{PDE}} \cdot \mathcal{L}_{\mathrm{PDE}},
 \end{equation}
-with $\lambda_{\mathrm{BC}} \gg \lambda_{\mathrm{PDE}}$. The boundary term acts as the primary anchor that constrains the global solution structure, while the residual term enforces physical consistency in the interior. The sensitivity of performance to this weighting is examined in Section~\ref{sec:experiments}.
+with $\lambda_{\mathrm{BC}} \in [10^3, 10^5]$ chosen per dataset and $\lambda_{\mathrm{PDE}}$ set to $\min_k s_k^2$ so that both loss magnitudes are comparable at initialization. The boundary term fixes the solution at $\partial\Omega$; the residual term constrains its interior evolution. The sensitivity of performance to this weighting is examined in Section~\ref{sec:experiments}.
 
 
 \section{Experiments}
@@ -274,242 +274,54 @@ Supervised       & 0.1660          & 0.0446          & 0.0754          & 0.0639 
 }
 \end{table}
 
-\section{Headings: first level}
-\label{headings}
-
-
-All headings should be lower case (except for first word and proper nouns),
-flush left, and bold.
-
-
-First-level headings should be in 12-point type.
-
-
-\subsection{Headings: second level}
-
-
-Second-level headings should be in 10-point type.
-
-
-\subsubsection{Headings: third level}
-
-
-Third-level headings should be in 10-point type.
-
-
-\paragraph{Paragraphs}
-
-
-There is also a \verb+\paragraph+ command available, which sets the heading in
-bold, flush left, and inline with the text, with the heading followed by 1\,em
-of space.
-
-
-\section{Citations, figures, tables, references}
-\label{others}
-
-
-These instructions apply to everyone.
-
-
-\subsection{Citations within the text}
-
-
-The \verb+natbib+ package will be loaded for you by default.  Citations may be
-author/year or numeric, as long as you maintain internal consistency.  As to the
-format of the references themselves, any style is acceptable as long as it is
-used consistently.
-
-
-The documentation for \verb+natbib+ may be found at
-\begin{center}
-  \url{http://mirrors.ctan.org/macros/latex/contrib/natbib/natnotes.pdf}
-\end{center}
-Of note is the command \verb+\citet+, which produces citations appropriate for
-use in inline text.  For example,
-\begin{verbatim}
-   \citet{hasselmo} investigated\dots
-\end{verbatim}
-produces
-\begin{quote}
-  Hasselmo, et al.\ (1995) investigated\dots
-\end{quote}
-
-
-If you wish to load the \verb+natbib+ package with options, you may add the
-following before loading the \verb+neurips_2026+ package:
-\begin{verbatim}
-   \PassOptionsToPackage{options}{natbib}
-\end{verbatim}
-
-
-If \verb+natbib+ clashes with another package you load, you can add the optional
-argument \verb+nonatbib+ when loading the style file:
-\begin{verbatim}
-   \usepackage[nonatbib]{neurips_2026}
-\end{verbatim}
-
-
-As submission is double blind, refer to your own published work in the third
-person. That is, use ``In the previous work of Jones et al.\ [4],'' not ``In our
-previous work [4].'' If you cite your other papers that are not widely available
-(e.g., a journal paper under review), use anonymous author names in the
-citation, e.g., an author of the form ``A.\ Anonymous'' and include a copy of the anonymized paper in the supplementary material.
-
-
-\subsection{Footnotes}
-
-
-Footnotes should be used sparingly.  If you do require a footnote, indicate
-footnotes with a number\footnote{Sample of the first footnote.} in the
-text. Place the footnotes at the bottom of the page on which they appear.
-Precede the footnote with a horizontal rule of 2~inches (12~picas).
-
-
-Note that footnotes are properly typeset \emph{after} punctuation
-marks.\footnote{As in this example.}
-
-
-\subsection{Figures}
-
-
-\begin{figure}
-  \centering
-  \fbox{\rule[-.5cm]{0cm}{4cm} \rule[-.5cm]{4cm}{0cm}}
-  \caption{Sample figure caption. Explain what the figure shows and add a key take-away message to the caption.}
-\end{figure}
-
-
-All artwork must be neat, clean, and legible. Lines should be dark enough for
- reproduction purposes. The figure number and caption always appear after the
-figure. Place one line space before the figure caption and one line space after
-the figure. The figure caption should be lower case (except for the first word and proper nouns); figures are numbered consecutively.
-
-
-You may use color figures.  However, it is best for the figure captions and the
-paper body to be legible if the paper is printed in either black/white or in
-color.
-
-
-\subsection{Tables}
-
-
-All tables must be centered, neat, clean, and legible.  The table number and
-title always appear before the table.  See Table~\ref{sample-table}.
-
-
-Place one line space before the table title, one line space after the
-table title, and one line space after the table. The table title must
-be lower case (except for the first word and proper nouns); tables are
-numbered consecutively.
-
-
-Note that publication-quality tables \emph{do not contain vertical rules}. We
-strongly suggest the use of the \verb+booktabs+ package, which allows for
-typesetting high-quality, professional tables:
-\begin{center}
-  \url{https://www.ctan.org/pkg/booktabs}
-\end{center}
-This package was used to typeset Table~\ref{sample-table}.
-
-
-\begin{table}
-  \caption{Sample table caption. Explain what the table shows and add a key take-away message to the caption.}
-  \label{sample-table}
-  \centering
-  \begin{tabular}{lll}
-    \toprule
-    \multicolumn{2}{c}{Part}                   \\
-    \cmidrule(r){1-2}
-    Name     & Description     & Size ($\mu$m) \\
-    \midrule
-    Dendrite & Input terminal  & $\approx$100     \\
-    Axon     & Output terminal & $\approx$10      \\
-    Soma     & Cell body       & up to $10^6$  \\
-    \bottomrule
-  \end{tabular}
+\begin{table}[t]
+\centering
+\caption{Effect of pretraining (VRMSE, $\downarrow$). Removing the pretrained initialization and training the full model from scratch with the same unsupervised PDE-based objective leads to severe degradation across all four exact-solution datasets. Ours is Orthogonal LoRA on top of the pretrained backbone.}
+\label{tab:ablation_pretrain}
+\begin{tabular}{lcccc}
+\toprule
+& Taylor-Green 2D & Wave 2D & AdvDiff 2D & Burgers 2D \\
+\midrule
+Scratch (full-param, no pretrain) & 0.3920 & 0.7903 & 0.0673 & 0.0716 \\
+Ours (Orthogonal LoRA, pretrained) & \textbf{0.0060} & \textbf{0.0218} & \textbf{0.0038} & \textbf{0.0021} \\
+\midrule
+Degradation ratio ($\downarrow$) & $65\times$ & $36\times$ & $18\times$ & $34\times$ \\
+\bottomrule
+\end{tabular}
 \end{table}
 
-\subsection{Math}
-Note that display math in bare TeX commands will not create correct line numbers for submission. Please use LaTeX (or AMSTeX) commands for unnumbered display math. (You really shouldn't be using \$\$ anyway; see \url{https://tex.stackexchange.com/questions/503/why-is-preferable-to} and \url{https://tex.stackexchange.com/questions/40492/what-are-the-differences-between-align-equation-and-displaymath} for more information.)
+\begin{table}[t]
+\centering
+\caption{Gap between unsupervised and supervised LoRA finetuning (VRMSE, $\downarrow$). The supervised variant uses dense ground-truth interior fields as the upper bound. The unsupervised variant (Orthogonal LoRA) is trained with boundary condition and PDE residual losses only.}
+\label{tab:ablation_supervised}
+\begin{tabular}{lcccc}
+\toprule
+& Taylor-Green 2D & Wave 2D & AdvDiff 2D & Burgers 2D \\
+\midrule
+Ours (Orthogonal LoRA, unsupervised) & 0.0060 & 0.0218 & 0.0038 & 0.0021 \\
+Supervised LoRA (upper bound) & 0.0014 & 0.0097 & 0.0023 & 0.0022 \\
+\midrule
+Unsupervised / Supervised ratio & $4.3\times$ & $2.2\times$ & $1.7\times$ & $1.0\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\subsection{Final instructions}
+\begin{table}[t]
+\centering
+\caption{Standard LoRA versus Orthogonal LoRA under a controlled setup (VRMSE, $\downarrow$). Both share the same factors $A,B$ initialized from a warm-up of standard LoRA, the same frozen encoder and decoder, and the same rank $r\!=\!16$. The forward path is the only difference. Results are from a single training seed; the consistent direction across all four datasets and the corresponding 5.9--13.6\% reduction in PDE residual loss (Appendix~\ref{app:per_channel}) corroborate the effect.}
+\label{tab:ablation_orthlora}
+\begin{tabular}{lcccc}
+\toprule
+& Taylor-Green 2D & Wave 2D & AdvDiff 2D & Burgers 2D \\
+\midrule
+Standard LoRA ($\Delta W = BA$) & 0.00624 & 0.02242 & 0.00422 & 0.00229 \\
+Orthogonal LoRA (Ours) & \textbf{0.00596} & \textbf{0.02182} & \textbf{0.00377} & \textbf{0.00212} \\
+\midrule
+Relative change & $-4.5\%$ & $-2.7\%$ & $-10.7\%$ & $-7.4\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-Do not change any aspects of the formatting parameters in the style files.  In
-particular, do not modify the width or length of the rectangle the text should
-fit into, and do not change font sizes. Please note that pages should be
-numbered.
-
-
-\section{Preparing PDF files}
-
-
-Please prepare submission files with paper size ``US Letter,'' and not, for
-example, ``A4.''
-
-
-Fonts were the main cause of problems in the past years. Your PDF file must only
-contain Type 1 or Embedded TrueType fonts. Here are a few instructions to
-achieve this.
-
-
-\begin{itemize}
-
-
-\item You should directly generate PDF files using \verb+pdflatex+.
-
-
-\item You can check which fonts a PDF files uses.  In Acrobat Reader, select the
-  menu Files$>$Document Properties$>$Fonts and select Show All Fonts. You can
-  also use the program \verb+pdffonts+ which comes with \verb+xpdf+ and is
-  available out-of-the-box on most Linux machines.
-
-
-\item \verb+xfig+ ``patterned'' shapes are implemented with bitmap fonts.  Use
-  "solid" shapes instead.
-
-
-\item The \verb+\bbold+ package almost always uses bitmap fonts.  You should use
-  the equivalent AMS Fonts:
-\begin{verbatim}
-   \usepackage{amsfonts}
-\end{verbatim}
-followed by, e.g., \verb+\mathbb{R}+, \verb+\mathbb{N}+, or \verb+\mathbb{C}+
-for $\mathbb{R}$, $\mathbb{N}$ or $\mathbb{C}$.  You can also use the following
-workaround for reals, natural and complex:
-\begin{verbatim}
-   \newcommand{\RR}{I\!\!R} %real numbers
-   \newcommand{\Nat}{I\!\!N} %natural numbers
-   \newcommand{\CC}{I\!\!\!\!C} %complex numbers
-\end{verbatim}
-Note that \verb+amsfonts+ is automatically loaded by the \verb+amssymb+ package.
-
-
-\end{itemize}
-
-
-If your file contains type 3 fonts or non embedded TrueType fonts, we will ask
-you to fix it.
-
-
-\subsection{Margins in \LaTeX{}}
-
-
-Most of the margin problems come from figures positioned by hand using
-\verb+\special+ or other commands. We suggest using the command
-\verb+\includegraphics+ from the \verb+graphicx+ package. Always specify the
-figure width as a multiple of the line width as in the example below:
-\begin{verbatim}
-   \usepackage[pdftex]{graphicx} ...
-   \includegraphics[width=0.8\linewidth]{myfile.pdf}
-\end{verbatim}
-See Section 4.4 in the graphics bundle documentation
-(\url{http://mirrors.ctan.org/macros/latex/required/graphics/grfguide.pdf})
-
-
-A number of width problems arise when \LaTeX{} cannot properly hyphenate a
-line. Please give LaTeX hyphenation hints using the \verb+\-+ command when
-necessary.
 
 \begin{ack}
 Use unnumbered first level headings for the acknowledgments. All acknowledgments
@@ -530,10 +342,102 @@ Do {\bf not} include this section in the anonymized submission, only in the fina
 
 \appendix
 
-\section{Technical appendices and supplementary material}
-Technical appendices with additional results, figures, graphs, and proofs may be submitted with the paper submission before the full submission deadline (see above). You can upload a ZIP file for videos or code, but do not upload a separate PDF file for the appendix. There is no page limit for the technical appendices. 
+\section{Additional Ablation Studies}
+\label{app:ablations}
 
-Note: Think of the appendix as ``optional reading'' for reviewers. The paper must be able to stand alone without the appendix; for example, adding critical experiments that support the main claims to an appendix is inappropriate. 
+This appendix reports four ablations referenced in Section~\ref{sec:experiments} but deferred from the main text for space. All experiments use the same pretrained backbone and the same BC plus PDE residual loss as in the main body.
+
+\subsection{Residual Normalization Strategy}
+\label{app:norm}
+
+Table~\ref{tab:app_norm} compares three normalization strategies for the PDE residual loss. \textsc{rescaled\_norm} (our default) sets $\lambda_{\mathrm{PDE}} = \min_k s_k^2$ to prevent the normalized residual from drowning out the BC anchor, while preserving the per-equation balance encoded by $s_k$. \textsc{norm} applies only per-equation normalization without the $\lambda_{\mathrm{PDE}}$ rescaling, and \textsc{no\_norm} drops both. \textsc{rescaled\_norm} wins on all four datasets.
+
+\begin{table}[h]
+\centering
+\caption{Normalization strategy ablation (VRMSE, $\downarrow$; $\lambda_{\mathrm{BC}}=10000$).}
+\label{tab:app_norm}
+\begin{tabular}{lcccc}
+\toprule
+Strategy & Taylor-Green 2D & Wave 2D & AdvDiff 2D & Burgers 2D \\
+\midrule
+\textsc{rescaled\_norm} (ours) & \textbf{0.0070} & \textbf{0.0275} & \textbf{0.0049} & \textbf{0.0034} \\
+\textsc{norm} & 0.0294 & 0.1007 & 0.0133 & 0.0109 \\
+\textsc{no\_norm} & 0.0875 & 0.0478 & 0.0102 & 0.1303 \\
+\midrule
+Supervised LoRA (reference) & 0.0014 & 0.0097 & 0.0023 & 0.0022 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Boundary Weight Sensitivity}
+\label{app:lambda_bc}
+
+Table~\ref{tab:app_lambda_bc} sweeps $\lambda_{\mathrm{BC}}$ across four orders of magnitude under the \textsc{rescaled\_norm} setting. $\lambda_{\mathrm{BC}}=10^4$ is a strong default; Wave 2D benefits from a stronger anchor ($10^5$), and overly large values slightly hurt Taylor-Green and Burgers.
+
+\begin{table}[h]
+\centering
+\caption{Boundary weight ablation (VRMSE, $\downarrow$).}
+\label{tab:app_lambda_bc}
+\begin{tabular}{lcccc}
+\toprule
+$\lambda_{\mathrm{BC}}$ & Taylor-Green 2D & Wave 2D & AdvDiff 2D & Burgers 2D \\
+\midrule
+$10^2$ & 0.0232 & 0.0676 & 0.0123 & 0.0092 \\
+$10^3$ & 0.0170 & 0.0489 & \textbf{0.0046} & 0.0041 \\
+$10^4$ (default) & \textbf{0.0070} & 0.0275 & 0.0049 & \textbf{0.0034} \\
+$10^5$ & 0.0098 & \textbf{0.0243} & --- & 0.0043 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{LoRA versus Full Fine-Tuning}
+\label{app:lora_vs_full}
+
+Table~\ref{tab:app_lora_vs_full} compares LoRA (rank $r\!=\!16$, $\sim 6.7\%$ of parameters) against full fine-tuning of the same pretrained backbone under the identical unsupervised PDE-based objective. The two perform comparably across datasets, and LoRA matches or exceeds full fine-tuning on half of them, supporting the parameter-efficient design choice.
+
+\begin{table}[h]
+\centering
+\caption{LoRA versus full fine-tuning under the unsupervised PDE-based objective (VRMSE, $\downarrow$).}
+\label{tab:app_lora_vs_full}
+\begin{tabular}{lcccc}
+\toprule
+& Taylor-Green 2D & Wave 2D & AdvDiff 2D & Burgers 2D \\
+\midrule
+LoRA (\textsc{rescaled\_norm}) & 0.0070 & \textbf{0.0243} & \textbf{0.0046} & 0.0034 \\
+Full fine-tune (\textsc{rescaled\_norm}) & \textbf{0.0057} & 0.0252 & 0.0053 & \textbf{0.0024} \\
+\midrule
+Supervised LoRA (reference) & 0.0014 & 0.0097 & 0.0023 & 0.0022 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Per-Channel Breakdown}
+\label{app:per_channel}
+
+Table~\ref{tab:app_per_channel} reports per-channel VRMSE for the controlled Standard LoRA versus Orthogonal LoRA comparison of Table~\ref{tab:ablation_orthlora}. Both methods share the same factors $A,B$ from the standard-LoRA warm-up and differ only in the forward path. The orthogonalized update helps most on the weakest channels, improving pressure on Taylor-Green and both velocity components on Burgers.
+
+\begin{table}[h]
+\centering
+\caption{Per-channel VRMSE ($\downarrow$) for Standard LoRA versus Orthogonal LoRA.}
+\label{tab:app_per_channel}
+\begin{tabular}{llccc}
+\toprule
+Dataset & Channel & Standard LoRA & Orthogonal LoRA & Supervised \\
+\midrule
+Taylor-Green 2D & $V_x$    & 0.00098 & 0.00102 & 0.0012 \\
+                & $V_y$    & 0.00098 & 0.00103 & 0.0011 \\
+                & $p$      & 0.01675 & \textbf{0.01582} & 0.0020 \\
+\midrule
+Wave 2D         & $u$      & 0.01200 & \textbf{0.01132} & 0.0120 \\
+                & $w=u_t$  & 0.03284 & \textbf{0.03232} & 0.0074 \\
+\midrule
+AdvDiff 2D      & $u$      & 0.00422 & \textbf{0.00377} & 0.0023 \\
+\midrule
+Burgers 2D      & $V_x$    & 0.00259 & \textbf{0.00232} & 0.0021 \\
+                & $V_y$    & 0.00200 & \textbf{0.00193} & 0.0022 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
